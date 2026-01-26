@@ -82,6 +82,51 @@ class YtDlpAdapter:
                 return entry
         return info
 
+    def fetch_playlist_preview(
+        self,
+        url: str,
+        limit: int = 20,
+        cookies_from_browser: Optional[str] = None,
+        js_runtime: Optional[str] = None,
+        js_runtime_path: Optional[str] = None,
+        remote_components: Optional[str] = None,
+    ) -> List[str]:
+        end = max(1, limit)
+        items_arg = f"1:{end}"
+        args = [
+            "yt-dlp",
+            "-J",
+            "--flat-playlist",
+            "--playlist-items",
+            items_arg,
+            url,
+        ]
+
+        if cookies_from_browser:
+            args.extend(["--cookies-from-browser", cookies_from_browser])
+        self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
+
+        self._log("Fetching playlist preview...")
+        result = subprocess.run(
+            args,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.stderr:
+            self._log(result.stderr.strip())
+
+        info = json.loads(result.stdout)
+        entries = info.get("entries") or []
+        titles: List[str] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                title = entry.get("title")
+                if title:
+                    titles.append(str(title))
+        return titles
+
     def extract_video_formats(self, info: Dict) -> List[FormatOption]:
         formats = info.get("formats") or []
         grouped: Dict[Tuple[Optional[int], Optional[float], Optional[str]], Dict] = {}
@@ -257,5 +302,10 @@ class YtDlpAdapter:
             if js_runtime_path:
                 runtime_arg = f"{js_runtime}:{js_runtime_path}"
             args.extend(["--js-runtimes", runtime_arg])
-        if remote_components:
+            if remote_components:
+                args.extend(["--remote-components", remote_components])
+        elif js_runtime_path:
+            args.extend(["--js-runtimes", js_runtime_path])
+            if remote_components:
+                args.extend(["--remote-components", remote_components])
             args.extend(["--remote-components", remote_components])

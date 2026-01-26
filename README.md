@@ -18,7 +18,7 @@ pip install -e .
 
 ### Run
 ```bash
-python main.py
+python app.py
 ```
 
 ### Notes on 403 / signature warnings
