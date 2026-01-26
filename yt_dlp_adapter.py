@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -6,6 +7,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 
 Logger = Callable[[str], None]
+ProgressCallback = Callable[[float], None]
 
 
 @dataclass(frozen=True)
@@ -15,11 +17,20 @@ class FormatOption:
     height: Optional[int]
     fps: Optional[float]
     ext: Optional[str]
+    filesize: Optional[int]
+    filesize_approx: Optional[int]
+    tbr: Optional[float]
 
 
 class YtDlpAdapter:
-    def __init__(self, logger: Optional[Logger] = None) -> None:
+    def __init__(
+        self,
+        logger: Optional[Logger] = None,
+        progress_cb: Optional[ProgressCallback] = None,
+    ) -> None:
         self._log = logger or (lambda msg: None)
+        self._progress = progress_cb or (lambda value: None)
+        self._process: Optional[subprocess.Popen[str]] = None
 
     def check_available(self) -> bool:
         try:
@@ -34,12 +45,24 @@ class YtDlpAdapter:
         except (subprocess.SubprocessError, FileNotFoundError):
             return False
 
-    def fetch_info(self, url: str, playlist_mode: bool) -> Dict:
+    def fetch_info(
+        self,
+        url: str,
+        playlist_mode: bool,
+        cookies_from_browser: Optional[str] = None,
+        js_runtime: Optional[str] = None,
+        js_runtime_path: Optional[str] = None,
+        remote_components: Optional[str] = None,
+    ) -> Dict:
         args = ["yt-dlp", "-J", url]
         if playlist_mode:
             args.extend(["--playlist-items", "1"])
         else:
             args.append("--no-playlist")
+
+        if cookies_from_browser:
+            args.extend(["--cookies-from-browser", cookies_from_browser])
+        self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
 
         self._log("Fetching format info...")
         result = subprocess.run(
@@ -85,6 +108,9 @@ class YtDlpAdapter:
                     height=height,
                     fps=fps,
                     ext=ext,
+                    filesize=fmt.get("filesize"),
+                    filesize_approx=fmt.get("filesize_approx"),
+                    tbr=fmt.get("tbr"),
                 )
             )
 
@@ -98,6 +124,10 @@ class YtDlpAdapter:
         format_id: Optional[str],
         audio_only: bool,
         playlist_mode: bool,
+        cookies_from_browser: Optional[str] = None,
+        js_runtime: Optional[str] = None,
+        js_runtime_path: Optional[str] = None,
+        remote_components: Optional[str] = None,
     ) -> None:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         if audio_only:
@@ -122,21 +152,43 @@ class YtDlpAdapter:
         else:
             args.append("--no-playlist")
 
+        if cookies_from_browser:
+            args.extend(["--cookies-from-browser", cookies_from_browser])
+        self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
+
         self._log("Starting download...")
-        process = subprocess.Popen(
+        self._process = subprocess.Popen(
             args,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.strip()
-            if line:
-                self._log(line)
-        process.wait()
-        if process.returncode != 0:
-            raise RuntimeError("yt-dlp exited with a non-zero status.")
+        process = self._process
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                line = line.strip()
+                if line:
+                    self._log(line)
+                    self._update_progress_from_line(line)
+            process.wait()
+            if process.returncode != 0:
+                raise RuntimeError("yt-dlp exited with a non-zero status.")
+            self._progress(1.0)
+        finally:
+            self._process = None
+
+    def cancel(self, output_dir: Optional[str], delete_partials: bool = True) -> None:
+        if self._process and self._process.poll() is None:
+            self._log("Cancelling download...")
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+            if delete_partials and output_dir:
+                self._delete_partials(output_dir)
+            self._log("Download cancelled.")
 
     @staticmethod
     def _build_label(
@@ -162,3 +214,48 @@ class YtDlpAdapter:
     @staticmethod
     def _format_score(fmt: Dict) -> float:
         return float(fmt.get("tbr") or fmt.get("filesize") or 0)
+
+    def _update_progress_from_line(self, line: str) -> None:
+        match = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
+        if match:
+            percent = float(match.group(1)) / 100.0
+            self._progress(max(0.0, min(1.0, percent)))
+
+    def check_runtime(self, runtime: str, runtime_path: Optional[str]) -> Tuple[bool, str]:
+        binary = runtime_path or runtime
+        try:
+            result = subprocess.run(
+                [binary, "--version"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            version = result.stdout.strip() or "OK"
+            return True, version
+        except (subprocess.SubprocessError, FileNotFoundError) as exc:
+            return False, str(exc)
+
+    def _delete_partials(self, output_dir: str) -> None:
+        base = Path(output_dir)
+        for suffix in ("*.part", "*.ytdl", "*.tmp"):
+            for path in base.glob(suffix):
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
+
+    @staticmethod
+    def _append_js_runtime_args(
+        args: List[str],
+        js_runtime: Optional[str],
+        js_runtime_path: Optional[str],
+        remote_components: Optional[str],
+    ) -> None:
+        if js_runtime:
+            runtime_arg = js_runtime
+            if js_runtime_path:
+                runtime_arg = f"{js_runtime}:{js_runtime_path}"
+            args.extend(["--js-runtimes", runtime_arg])
+        if remote_components:
+            args.extend(["--remote-components", remote_components])
