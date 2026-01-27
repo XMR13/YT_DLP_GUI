@@ -16,6 +16,8 @@ class DownloadController:
         self._adapter = adapter
         self._active_output_dir: Optional[str] = None
         self._cancel_requested = False
+        self._formats_request_id = 0
+        self._formats_lock = threading.Lock()
 
     def fetch_formats(
         self,
@@ -26,11 +28,15 @@ class DownloadController:
         js_runtime: Optional[str] = None,
         js_runtime_path: Optional[str] = None,
         remote_components: Optional[str] = None,
-    ) -> None:
+    ) -> int:
+        with self._formats_lock:
+            self._formats_request_id += 1
+            request_id = self._formats_request_id
         self._events.put(("busy", (True, "fetch")))
         threading.Thread(
             target=self._fetch_formats_worker,
             args=(
+                request_id,
                 url,
                 playlist_mode,
                 playlist_items,
@@ -41,6 +47,7 @@ class DownloadController:
             ),
             daemon=True,
         ).start()
+        return request_id
 
     def fetch_preview(
         self,
@@ -97,6 +104,7 @@ class DownloadController:
 
     def _fetch_formats_worker(
         self,
+        request_id: int,
         url: str,
         playlist_mode: bool,
         playlist_items: Optional[str],
@@ -116,8 +124,8 @@ class DownloadController:
                 remote_components,
             )
             options = self._adapter.extract_video_formats(info)
-            self._events.put(("formats", options))
-            self._events.put(("info", info))
+            self._events.put(("formats", (request_id, options)))
+            self._events.put(("info", (request_id, info)))
             title = info.get("title") or "Selection loaded."
             self._events.put(("log", f"Formats loaded for: {title}"))
         except Exception as exc:  # noqa: BLE001 - UI surface for any failures.

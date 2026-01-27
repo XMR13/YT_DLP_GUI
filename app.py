@@ -21,6 +21,10 @@ from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
 
 
 class App(ctk.CTk):
+    SCROLL_SPEED = 20
+    STATUS_MIN_HEIGHT = 160
+    STATUS_MAX_HEIGHT = 260
+    PLAYLIST_AUTO_FETCH_DELAY_MS = 250
     def __init__(self) -> None:
         super().__init__()
 
@@ -39,6 +43,10 @@ class App(ctk.CTk):
         self._current_info: Dict = {}
         self._current_task: Optional[str] = None
         self._solver_warning_shown = False
+        self._layout_job: Optional[str] = None
+        self._auto_fetch_job: Optional[str] = None
+        self._expected_formats_request_id: Optional[int] = None
+        self._warning_once: set[str] = set()
 
         self.url_var = ctk.StringVar()
         self.playlist_url_var = ctk.StringVar()
@@ -64,13 +72,14 @@ class App(ctk.CTk):
         header = Header(self)
         header.pack(fill="x", padx=20, pady=(20, 10))
 
-        body = ctk.CTkFrame(self, corner_radius=18)
-        body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self._body = ctk.CTkFrame(self, corner_radius=18)
+        self._body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        content = ctk.CTkScrollableFrame(body, corner_radius=0, fg_color="transparent")
-        content.pack(fill="both", expand=True)
+        self._content = ctk.CTkScrollableFrame(self._body, corner_radius=0, fg_color="transparent")
+        self._content.pack(fill="both", expand=True)
+        self._bind_scroll_events(self._content, speed=self.SCROLL_SPEED)
 
-        self.tabview = ctk.CTkTabview(content)
+        self.tabview = ctk.CTkTabview(self._content)
         self.tabview.pack(fill="x", padx=18, pady=18)
 
         single_tab = self.tabview.add("Single")
@@ -101,7 +110,7 @@ class App(ctk.CTk):
         self.playlist_form_panel.pack(fill="x", padx=18, pady=(18, 10))
 
         self.options_panel = OptionsPanel(
-            content,
+            self._content,
             format_type_var=self.format_type_var,
             resolution_var=self.resolution_var,
             output_dir_var=self.output_dir_var,
@@ -114,17 +123,22 @@ class App(ctk.CTk):
         )
         self.options_panel.pack(fill="x", padx=18, pady=(0, 18))
 
-        self.info_panel = InfoPanel(content)
+        self.info_panel = InfoPanel(self._content)
         self.info_panel.pack(fill="x", padx=18, pady=(0, 18))
 
         self.preview_panel = PlaylistPreviewPanel(
             playlist_tab,
             on_select=self._on_playlist_item_selected,
+            scroll_speed=self.SCROLL_SPEED,
         )
         self.preview_panel.pack(fill="x", padx=18, pady=(0, 18))
         self.preview_panel.set_items([])
 
-        self.status_panel = StatusPanel(content)
+        self.status_panel = StatusPanel(
+            self._content,
+            min_height=self.STATUS_MIN_HEIGHT,
+            max_height=self.STATUS_MAX_HEIGHT,
+        )
         self.status_panel.pack(fill="x", padx=18, pady=(0, 18))
         self._append_log("Ready.")
 
@@ -133,6 +147,62 @@ class App(ctk.CTk):
             (self.playlist_form_panel.progress, self.playlist_form_panel.progress_label),
         ]
         self._set_playlist_selection_state(False)
+        self._body.bind("<Configure>", self._schedule_layout_update)
+        self._schedule_layout_update()
+
+    @staticmethod
+    def _bind_scroll_events(scrollable: ctk.CTkScrollableFrame, speed: int = 5) -> None:
+        canvas = getattr(scrollable, "_parent_canvas", None) or getattr(scrollable, "_canvas", None)
+        if canvas is None:
+            return
+
+        def on_mousewheel(event: object) -> None:
+            delta = 0
+            wheel_delta = int(getattr(event, "delta", 0))
+            if wheel_delta:
+                delta = int(-1 * (wheel_delta / 120))
+                if delta == 0:
+                    delta = -1 if wheel_delta > 0 else 1
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                canvas.yview_scroll(delta * max(1, speed), "units")
+
+        def bind_to_mousewheel(_event: object) -> None:
+            scrollable.bind_all("<MouseWheel>", on_mousewheel)
+            scrollable.bind_all("<Button-4>", on_mousewheel)
+            scrollable.bind_all("<Button-5>", on_mousewheel)
+
+        def unbind_from_mousewheel(_event: object) -> None:
+            scrollable.unbind_all("<MouseWheel>")
+            scrollable.unbind_all("<Button-4>")
+            scrollable.unbind_all("<Button-5>")
+
+        scrollable.bind("<Enter>", bind_to_mousewheel)
+        scrollable.bind("<Leave>", unbind_from_mousewheel)
+
+    def _schedule_layout_update(self, _event: object | None = None) -> None:
+        if self._layout_job:
+            self.after_cancel(self._layout_job)
+        self._layout_job = self.after(60, self._apply_dynamic_layout)
+
+    def _apply_dynamic_layout(self) -> None:
+        self._layout_job = None
+        if not self._content.winfo_exists():
+            return
+        view_height = self._content.winfo_height()
+        if view_height <= 1:
+            self._layout_job = self.after(60, self._apply_dynamic_layout)
+            return
+        fixed = (
+            self.tabview.winfo_height()
+            + self.options_panel.winfo_height()
+            + self.info_panel.winfo_height()
+        )
+        available = view_height - fixed - 60
+        self.status_panel.set_height(available)
 
     def _check_yt_dlp(self) -> None:
         if not self._adapter.check_available():
@@ -174,7 +244,7 @@ class App(ctk.CTk):
             return
 
         self._set_busy(True, task="fetch")
-        self._controller.fetch_formats(
+        self._expected_formats_request_id = self._controller.fetch_formats(
             url=url,
             playlist_mode=False,
             playlist_items=None,
@@ -244,7 +314,7 @@ class App(ctk.CTk):
             return
 
         self._set_busy(True, task="fetch")
-        self._controller.fetch_formats(
+        self._expected_formats_request_id = self._controller.fetch_formats(
             url=url,
             playlist_mode=True,
             playlist_items=str(self._selected_playlist_item.index),
@@ -371,6 +441,7 @@ class App(ctk.CTk):
         self._set_playlist_selection_state(True)
         self._current_info = {"title": item.title, "duration": item.duration}
         self._update_info_display()
+        self._schedule_auto_fetch_selected()
 
     def _set_playlist_selection_state(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
@@ -402,6 +473,17 @@ class App(ctk.CTk):
         self._event_queue.put(("progress", value))
 
     def _append_log(self, message: str) -> None:
+        once_markers = (
+            "No supported JavaScript runtime could be found.",
+            "Some web_safari client https formats have been skipped",
+            "Some web client https formats have been skipped",
+        )
+        for marker in once_markers:
+            if marker in message:
+                if marker in self._warning_once:
+                    return
+                self._warning_once.add(marker)
+                break
         if not self._solver_warning_shown and (
             "Signature solving failed" in message or "challenge solving failed" in message
         ):
@@ -433,6 +515,7 @@ class App(ctk.CTk):
         info = self._current_info or {}
         title = info.get("title") or "—"
         duration = self._format_duration(info.get("duration"))
+        duration_seconds = info.get("duration") if isinstance(info.get("duration"), (int, float)) else None
 
         if self.format_type_var.get() == "Audio only":
             resolution = "Audio only"
@@ -453,6 +536,8 @@ class App(ctk.CTk):
                     resolution = f"{resolution} @ {fps_text}fps"
                 fmt = option.ext or "Unknown"
                 size_bytes = option.filesize or option.filesize_approx
+                if not size_bytes and option.tbr and duration_seconds:
+                    size_bytes = self._estimate_filesize_bytes(option.tbr, duration_seconds)
                 size = self._format_size(size_bytes)
             else:
                 resolution = "Best available"
@@ -467,6 +552,33 @@ class App(ctk.CTk):
                 "format": fmt,
                 "size": size,
             }
+        )
+        if self._selected_playlist_item:
+            self.preview_panel.update_selected_size(size)
+
+    def _schedule_auto_fetch_selected(self) -> None:
+        if self._auto_fetch_job:
+            self.after_cancel(self._auto_fetch_job)
+        self._auto_fetch_job = self.after(
+            self.PLAYLIST_AUTO_FETCH_DELAY_MS, self._auto_fetch_selected_formats
+        )
+
+    def _auto_fetch_selected_formats(self) -> None:
+        self._auto_fetch_job = None
+        if not self._selected_playlist_item:
+            return
+        url = self.playlist_url_var.get().strip()
+        if not url:
+            return
+        self.preview_panel.update_selected_size("loading...")
+        self._expected_formats_request_id = self._controller.fetch_formats(
+            url=url,
+            playlist_mode=True,
+            playlist_items=str(self._selected_playlist_item.index),
+            cookies=self._normalize_cookies(),
+            js_runtime=self._normalize_js_runtime(),
+            js_runtime_path=self._normalize_runtime_path(),
+            remote_components=self._normalize_remote_components(),
         )
 
     @staticmethod
@@ -492,12 +604,23 @@ class App(ctk.CTk):
             size /= 1024
         return f"{size:.1f} TB"
 
+    @staticmethod
+    def _estimate_filesize_bytes(tbr_kbps: float, duration_seconds: float) -> int:
+        bytes_per_second = (tbr_kbps * 1000) / 8
+        return int(bytes_per_second * float(duration_seconds))
+
     def _poll_events(self) -> None:
         try:
             while True:
                 event, payload = self._event_queue.get_nowait()
                 if event == "formats":
-                    self._format_options = list(payload)  # type: ignore[arg-type]
+                    request_id: Optional[int] = None
+                    options = payload
+                    if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[0], int):
+                        request_id, options = payload
+                    if request_id is not None and request_id != self._expected_formats_request_id:
+                        continue
+                    self._format_options = list(options)  # type: ignore[arg-type]
                     self._format_map = {opt.label: opt for opt in self._format_options}
                     values = [opt.label for opt in self._format_options]
                     if values:
@@ -514,7 +637,13 @@ class App(ctk.CTk):
                     self._current_info = {}
                     self._update_info_display()
                 elif event == "info":
-                    self._current_info = dict(payload)  # type: ignore[arg-type]
+                    request_id: Optional[int] = None
+                    info = payload
+                    if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[0], int):
+                        request_id, info = payload
+                    if request_id is not None and request_id != self._expected_formats_request_id:
+                        continue
+                    self._current_info = dict(info)  # type: ignore[arg-type]
                     self._update_info_display()
                 elif event == "log":
                     self._append_log(str(payload))

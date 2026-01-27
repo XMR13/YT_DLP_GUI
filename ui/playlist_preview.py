@@ -17,9 +17,11 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self,
         master: ctk.CTk,
         on_select: Optional[Callable[[PlaylistItem], None]] = None,
+        scroll_speed: int = 1,
         **kwargs: object,
     ) -> None:
         super().__init__(master, corner_radius=12, **kwargs)
+        self._scroll_speed = max(1, int(scroll_speed))
 
         title = ctk.CTkLabel(self, text="Playlist preview (first 20)")
         title.pack(anchor="w", padx=12, pady=(12, 6))
@@ -32,14 +34,53 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._placeholder = self._build_placeholder()
         self._on_select = on_select
         self._selected_row: Optional[ctk.CTkFrame] = None
+        self._selected_item_index: Optional[int] = None
         self._row_color = ("#E9E9E9", "#2B2B2B")
         self._selected_color = ("#D6D6D6", "#3A3A3A")
+        self._row_meta: Dict[int, ctk.CTkLabel] = {}
+        self._row_duration: Dict[int, str] = {}
+        self._bind_scroll_events()
+
+    def _bind_scroll_events(self) -> None:
+        canvas = getattr(self._list_frame, "_parent_canvas", None) or getattr(self._list_frame, "_canvas", None)
+        if canvas is None:
+            return
+
+        def on_mousewheel(event: object) -> None:
+            delta = 0
+            wheel_delta = int(getattr(event, "delta", 0))
+            if wheel_delta:
+                delta = int(-1 * (wheel_delta / 120))
+                if delta == 0:
+                    delta = -1 if wheel_delta > 0 else 1
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                canvas.yview_scroll(delta * self._scroll_speed, "units")
+
+        def bind_to_mousewheel(_event: object) -> None:
+            self._list_frame.bind_all("<MouseWheel>", on_mousewheel)
+            self._list_frame.bind_all("<Button-4>", on_mousewheel)
+            self._list_frame.bind_all("<Button-5>", on_mousewheel)
+
+        def unbind_from_mousewheel(_event: object) -> None:
+            self._list_frame.unbind_all("<MouseWheel>")
+            self._list_frame.unbind_all("<Button-4>")
+            self._list_frame.unbind_all("<Button-5>")
+
+        self._list_frame.bind("<Enter>", bind_to_mousewheel)
+        self._list_frame.bind("<Leave>", unbind_from_mousewheel)
 
     def set_items(self, items: List[PlaylistItem]) -> None:
         for item in self._items:
             item.destroy()
         self._items.clear()
         self._selected_row = None
+        self._selected_item_index = None
+        self._row_meta.clear()
+        self._row_duration.clear()
 
         if not items:
             empty = ctk.CTkLabel(self._list_frame, text="No items to preview.")
@@ -66,12 +107,14 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
             title.pack(anchor="w")
 
             duration = self._format_duration(item.duration)
+            self._row_duration[item.index] = duration
             meta = ctk.CTkLabel(
                 text_frame,
                 text=f"Duration: {duration}  •  Size: fetch formats",
                 anchor="w",
             )
             meta.pack(anchor="w")
+            self._row_meta[item.index] = meta
 
             self._items.append(row)
 
@@ -137,8 +180,18 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
             self._selected_row.configure(fg_color=self._row_color)
         row.configure(fg_color=self._selected_color)
         self._selected_row = row
+        self._selected_item_index = item.index
         if self._on_select:
             self._on_select(item)
+
+    def update_selected_size(self, size_text: str) -> None:
+        if self._selected_item_index is None:
+            return
+        meta = self._row_meta.get(self._selected_item_index)
+        duration = self._row_duration.get(self._selected_item_index, "—")
+        if not meta or not meta.winfo_exists():
+            return
+        meta.configure(text=f"Duration: {duration}  •  Size: {size_text}")
 
     @staticmethod
     def _format_duration(value: Optional[int]) -> str:
