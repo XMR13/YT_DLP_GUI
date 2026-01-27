@@ -23,14 +23,34 @@ class InfoPanel(ctk.CTkFrame):
 
         for idx, (label, key) in enumerate(info_fields, start=1):
             name_label = ctk.CTkLabel(self, text=label)
-            name_label.grid(row=idx, column=0, sticky="w", padx=12, pady=(0, 6))
-            value_label = ctk.CTkLabel(self, text="—")
-            value_label.grid(row=idx, column=1, sticky="w", padx=12, pady=(0, 6))
+            name_label.grid(row=idx, column=0, sticky="nw", padx=12, pady=(0, 6))
+
+            value_label = ctk.CTkLabel(
+                self,
+                text="—",
+                anchor="w",
+                justify="left",
+            )
+            value_label.grid(row=idx, column=1, sticky="ew", padx=12, pady=(0, 6))
             self.values[key] = value_label
 
         self.columnconfigure(0, weight=0)
         self.columnconfigure(1, weight=1)
 
+        self.bind("<Configure>", self._on_configure)
+        self.after(0, self._update_title_wraplength)
+
+    def _update_title_wraplength(self) -> None:
+        title_label = self.values.get("title")
+        if not title_label:
+            return
+        width = self.winfo_width()
+        wraplength = max(200, width - 280)
+        title_label.configure(wraplength=wraplength)
+
+    def _on_configure(self, _event: object) -> None:
+        self._update_title_wraplength()
+
     def update_values(self, values: Dict[str, str]) -> None:
-        for key, label in self.values.items():
-            label.configure(text=values.get(key, "—"))
+        for key, widget in self.values.items():
+            widget.configure(text=values.get(key, "—"))

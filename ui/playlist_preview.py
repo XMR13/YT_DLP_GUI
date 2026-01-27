@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 import threading
 from typing import Callable, Dict, List, Optional
+import tkinter as tk
 
 import customtkinter as ctk
 from PIL import Image
@@ -67,7 +68,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
             duration = self._format_duration(item.duration)
             meta = ctk.CTkLabel(
                 text_frame,
-                text=f"Duration: {duration}  •  Size: —",
+                text=f"Duration: {duration}  •  Size: fetch formats",
                 anchor="w",
             )
             meta.pack(anchor="w")
@@ -85,7 +86,11 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
 
     def _load_thumbnail_async(self, url: str, label: ctk.CTkLabel) -> None:
         if url in self._image_cache:
-            label.configure(image=self._image_cache[url])
+            try:
+                if label.winfo_exists():
+                    label.configure(image=self._image_cache[url])
+            except tk.TclError:
+                pass
             return
 
         def worker() -> None:
@@ -97,7 +102,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
                 image.thumbnail((120, 68))
                 ctk_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
                 self._image_cache[url] = ctk_image
-                label.after(0, lambda: self._apply_thumbnail(label, ctk_image))
+                self.after(0, lambda: self._apply_thumbnail(label, ctk_image))
             except Exception:
                 pass
 
@@ -105,8 +110,13 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
 
     @staticmethod
     def _apply_thumbnail(label: ctk.CTkLabel, image: ctk.CTkImage) -> None:
-        label.configure(image=image)
-        label.image = image
+        try:
+            if not label.winfo_exists():
+                return
+            label.configure(image=image)
+            label.image = image
+        except tk.TclError:
+            pass
 
     def _bind_select(
         self,

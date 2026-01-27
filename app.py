@@ -67,7 +67,10 @@ class App(ctk.CTk):
         body = ctk.CTkFrame(self, corner_radius=18)
         body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        self.tabview = ctk.CTkTabview(body)
+        content = ctk.CTkScrollableFrame(body, corner_radius=0, fg_color="transparent")
+        content.pack(fill="both", expand=True)
+
+        self.tabview = ctk.CTkTabview(content)
         self.tabview.pack(fill="x", padx=18, pady=18)
 
         single_tab = self.tabview.add("Single")
@@ -98,7 +101,7 @@ class App(ctk.CTk):
         self.playlist_form_panel.pack(fill="x", padx=18, pady=(18, 10))
 
         self.options_panel = OptionsPanel(
-            body,
+            content,
             format_type_var=self.format_type_var,
             resolution_var=self.resolution_var,
             output_dir_var=self.output_dir_var,
@@ -111,7 +114,7 @@ class App(ctk.CTk):
         )
         self.options_panel.pack(fill="x", padx=18, pady=(0, 18))
 
-        self.info_panel = InfoPanel(body)
+        self.info_panel = InfoPanel(content)
         self.info_panel.pack(fill="x", padx=18, pady=(0, 18))
 
         self.preview_panel = PlaylistPreviewPanel(
@@ -121,8 +124,8 @@ class App(ctk.CTk):
         self.preview_panel.pack(fill="x", padx=18, pady=(0, 18))
         self.preview_panel.set_items([])
 
-        self.status_panel = StatusPanel(body)
-        self.status_panel.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        self.status_panel = StatusPanel(content)
+        self.status_panel.pack(fill="x", padx=18, pady=(0, 18))
         self._append_log("Ready.")
 
         self._progress_targets = [
@@ -438,6 +441,8 @@ class App(ctk.CTk):
         else:
             selected = self.resolution_var.get()
             option = self._format_map.get(selected)
+            if selected == "Best available" and self._format_options:
+                option = self._format_options[0]
             if option:
                 resolution = f"{option.height}p" if option.height else "Unknown"
                 if option.fps:
