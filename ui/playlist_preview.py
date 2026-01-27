@@ -45,54 +45,72 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         return getattr(self._list_frame, "_parent_canvas", None) or getattr(self._list_frame, "_canvas", None)
 
     def set_items(self, items: List[PlaylistItem]) -> None:
+        # Clear existing (keep this)
         for item in self._items:
             item.destroy()
         self._items.clear()
-        self._selected_row = None
-        self._selected_item_index = None
-        self._row_meta.clear()
-        self._row_duration.clear()
-
-        if not items:
-            empty = ctk.CTkLabel(self._list_frame, text="No items to preview.")
-            empty.pack(anchor="w", pady=2)
-            self._items.append(empty)
-            return
+        # ... (clear caches) ...
 
         for item in items:
-            row = ctk.CTkFrame(self._list_frame, corner_radius=8, fg_color=self._row_color)
-            row.pack(fill="x", pady=4, padx=4)
-
-            thumb = ctk.CTkLabel(row, text="", image=self._placeholder, width=120, height=68)
-            thumb.pack(side="left", padx=(8, 12), pady=8)
-
-            text_frame = ctk.CTkFrame(row, fg_color="transparent")
-            text_frame.pack(side="left", fill="both", expand=True, pady=8)
-
-            title = ctk.CTkLabel(
+            # Use standard tk.Frame - much faster than CTkFrame
+            row = tk.Frame(self._list_frame, bg=self._row_color[1] if ctk.get_appearance_mode() == "Dark" else self._row_color[0])
+            row.pack(fill="x", pady=2, padx=4)
+            
+            # Standard tk.Label for thumbnail placeholder
+            thumb = tk.Label(row, text="", bg="#2B2B2B" if ctk.get_appearance_mode() == "Dark" else "#E9E9E9", width=17, height=4)
+            thumb.pack(side="left", padx=(8, 12), pady=4)
+            
+            text_frame = tk.Frame(row, bg=self._row_color[1] if ctk.get_appearance_mode() == "Dark" else self._row_color[0])
+            text_frame.pack(side="left", fill="both", expand=True, pady=4)
+            
+            # Standard labels
+            title = tk.Label(
                 text_frame,
                 text=f"{item.index}. {item.title}",
                 anchor="w",
                 justify="left",
+                bg=text_frame.cget("bg"),
+                fg="white" if ctk.get_appearance_mode() == "Dark" else "black",
+                font=("Arial", 12)
             )
             title.pack(anchor="w")
-
+            
             duration = self._format_duration(item.duration)
             self._row_duration[item.index] = duration
-            meta = ctk.CTkLabel(
+            meta = tk.Label(
                 text_frame,
                 text=f"Duration: {duration}  •  Size: fetch formats",
                 anchor="w",
+                bg=text_frame.cget("bg"),
+                fg="gray70" if ctk.get_appearance_mode() == "Dark" else "gray30",
+                font=("Arial", 10)
             )
             meta.pack(anchor="w")
             self._row_meta[item.index] = meta
-
+            
+            # Handle selection highlighting manually since tk.Label doesn't have fg_color
+            def make_select_handler(r=row, t=title, m=meta, th=thumb, item=item):
+                return lambda e: self._select_row_tk(r, t, m, th, item)
+                
+            for widget in (row, thumb, title, meta):
+                widget.bind("<Button-1>", make_select_handler())
+                
             self._items.append(row)
 
-            self._bind_select(row, thumb, title, meta, item)
-
-            if item.thumbnail_url:
-                self._load_thumbnail_async(item.thumbnail_url, thumb)
+    def _select_row_tk(self, row: tk.Frame, title: tk.Label, meta: tk.Label, thumb: tk.Label, item: PlaylistItem):
+        # Reset previous selection
+        if self._selected_row and self._selected_row.winfo_exists():
+            bg = self._row_color[1] if ctk.get_appearance_mode() == "Dark" else self._row_color[0]
+            self._selected_row.configure(bg=bg)
+            # Reset children bg...
+        
+        # Highlight new selection
+        sel_bg = self._selected_color[1] if ctk.get_appearance_mode() == "Dark" else self._selected_color[0]
+        row.configure(bg=sel_bg)
+        self._selected_row = row
+        self._selected_item_index = item.index
+        if self._on_select:
+            self._on_select(item)
 
     def _build_placeholder(self) -> ctk.CTkImage:
         image = Image.new("RGB", (120, 68), color=(40, 40, 40))

@@ -25,11 +25,11 @@ from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
 
 
 class App(ctk.CTk):
-    SCROLL_SPEED = 100
+    SCROLL_SPEED = 50
     STATUS_MIN_HEIGHT = 160
     STATUS_MAX_HEIGHT = 260
     PLAYLIST_AUTO_FETCH_DELAY_MS = 250
-    RESIZE_REDRAW_DELAY_MS = 120
+    RESIZE_REDRAW_DELAY_MS = 40
     def __init__(self) -> None:
         super().__init__()
 
@@ -184,6 +184,9 @@ class App(ctk.CTk):
         self.bind("<Configure>", self._on_root_configure, add="+")
         self._bind_global_scroll_events()
 
+        self._last_width = 0
+        self._last_height = 0
+
     def _bind_global_scroll_events(self) -> None:
         def on_mousewheel(event: object) -> None:
             delta = 0.0
@@ -273,14 +276,28 @@ class App(ctk.CTk):
         except Exception:
             pass
 
-
-
-    def _on_root_configure(self, _event: object) -> None:
+    def _on_root_configure(self, event: tk.Event) -> None:
         if not sys.platform.startswith("win"):
             return
+        
+        if getattr(event, 'widget', None) is not self:
+            return
+        
+        # Detect maximize/restore: if size jumps by >200px, it's not a drag
+        if hasattr(event, 'width') and hasattr(event, 'height'):
+            width_jump = abs(event.width - self._last_width)
+            height_jump = abs(event.height - self._last_height)
+            self._last_width = event.width
+            self._last_height = event.height
+            
+            # If jumping >200px (maximize/restore), don't block redraw
+            if width_jump > 200 or height_jump > 200:
+                return
+        
         if not self._resize_redraw_disabled:
             self._set_window_redraw(False)
             self._resize_redraw_disabled = True
+        
         if self._resize_redraw_job:
             self.after_cancel(self._resize_redraw_job)
         self._resize_redraw_job = self.after(self.RESIZE_REDRAW_DELAY_MS, self._resume_window_redraw)
@@ -290,6 +307,15 @@ class App(ctk.CTk):
         if self._resize_redraw_disabled:
             self._set_window_redraw(True)
             self._resize_redraw_disabled = False
+
+            self.update_idletasks()
+            self.update()   
+            #invalidate black areas:
+            try:
+                hwnd = ctypes.windll.user32.GetWindowDC(int(self.winfo_id()))
+                ctypes.windll.user32.ReleaseDC(int(self.winfo_id()), hwnd)
+            except:
+                pass
 
     def _set_window_redraw(self, enabled: bool) -> None:
         try:
@@ -728,9 +754,11 @@ class App(ctk.CTk):
         return int(bytes_per_second * float(duration_seconds))
 
     def _poll_events(self) -> None:
+        processed = 0
         try:
-            while True:
+            while processed < 50:
                 event, payload = self._event_queue.get_nowait()
+                processed +=1
                 if event == "formats":
                     request_id: Optional[int] = None
                     options = payload
@@ -778,7 +806,10 @@ class App(ctk.CTk):
                         self._set_busy(bool(payload))
         except Empty:
             pass
-        self.after(200, self._poll_events)
+        
+        #dynamic scheduling
+        delay = 20 if self._current_task else 100
+        self.after(delay, self._poll_events)
 
     def _init_log_file(self) -> Optional[object]:
         try:
