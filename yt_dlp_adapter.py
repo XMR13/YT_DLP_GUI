@@ -9,6 +9,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 Logger = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
 
+class DownloadCancelled(Exception):
+    """Raised when the user cancels an in-flight download."""
+
 
 @dataclass(frozen=True)
 class FormatOption:
@@ -42,6 +45,7 @@ class YtDlpAdapter:
         self._log = logger or (lambda msg: None)
         self._progress = progress_cb or (lambda value: None)
         self._process: Optional[subprocess.Popen[str]] = None
+        self._cancel_requested = False
 
     def check_available(self) -> bool:
         try:
@@ -205,6 +209,7 @@ class YtDlpAdapter:
         js_runtime_path: Optional[str] = None,
         remote_components: Optional[str] = None,
     ) -> None:
+        self._cancel_requested = False
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         if audio_only:
             format_selector = "bestaudio"
@@ -235,28 +240,10 @@ class YtDlpAdapter:
         self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
 
         self._log("Starting download...")
-        self._process = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        process = self._process
-        try:
-            assert process.stdout is not None
-            for line in process.stdout:
-                line = line.strip()
-                if line:
-                    self._log(line)
-                    self._update_progress_from_line(line)
-            process.wait()
-            if process.returncode != 0:
-                raise RuntimeError("yt-dlp exited with a non-zero status.")
-            self._progress(1.0)
-        finally:
-            self._process = None
+        self._run_download_with_retry(args)
 
     def cancel(self, output_dir: Optional[str], delete_partials: bool = True) -> None:
+        self._cancel_requested = True
         if self._process and self._process.poll() is None:
             self._log("Cancelling download...")
             self._process.terminate()
@@ -267,6 +254,76 @@ class YtDlpAdapter:
             if delete_partials and output_dir:
                 self._delete_partials(output_dir)
             self._log("Download cancelled.")
+
+    def _run_download_with_retry(self, args: List[str]) -> None:
+        had_forbidden = False
+        had_sabr_warning = False
+        if self._cancel_requested:
+            raise DownloadCancelled()
+        try:
+            self._process = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            process = self._process
+            assert process.stdout is not None
+            for line in process.stdout:
+                if self._cancel_requested:
+                    raise DownloadCancelled()
+                line = line.strip()
+                if not line:
+                    continue
+                if "HTTP Error 403" in line or "403: Forbidden" in line:
+                    had_forbidden = True
+                if "Some web client https formats have been skipped" in line:
+                    had_sabr_warning = True
+                self._log(line)
+                self._update_progress_from_line(line)
+            process.wait()
+            if self._cancel_requested:
+                raise DownloadCancelled()
+            if process.returncode == 0:
+                self._progress(1.0)
+                return
+        finally:
+            self._process = None
+
+        # Retry once with a different YouTube client to avoid SABR/HLS issues.
+        if self._cancel_requested:
+            raise DownloadCancelled()
+        if had_forbidden or had_sabr_warning:
+            retry_args = list(args)
+            retry_args.extend(["--extractor-args", "youtube:player_client=android"])
+            self._log("Retrying with YouTube android client due to 403/SABR warning...")
+            self._process = subprocess.Popen(
+                retry_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            process = self._process
+            try:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    if self._cancel_requested:
+                        raise DownloadCancelled()
+                    line = line.strip()
+                    if line:
+                        self._log(line)
+                        self._update_progress_from_line(line)
+                process.wait()
+                if self._cancel_requested:
+                    raise DownloadCancelled()
+                if process.returncode != 0:
+                    raise RuntimeError("yt-dlp exited with a non-zero status.")
+                self._progress(1.0)
+                return
+            finally:
+                self._process = None
+
+        raise RuntimeError("yt-dlp exited with a non-zero status.")
 
     @staticmethod
     def _build_label(

@@ -11,19 +11,29 @@ class StatusPanel(ctk.CTkFrame):
     ) -> None:
         super().__init__(master, corner_radius=12, **kwargs)
 
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
         log_label = ctk.CTkLabel(self, text="Status")
-        log_label.pack(anchor="w", padx=12, pady=(12, 4))
+        log_label.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
 
         self._min_height = min_height
         self._max_height = max_height
         self.log_box = ctk.CTkTextbox(self, height=self._min_height, wrap="word")
-        self.log_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.log_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self.log_box.configure(state="disabled")
 
     def set_height(self, height: int) -> None:
         target = max(self._min_height, int(height))
         if self._max_height:
             target = min(self._max_height, target)
+        # Avoid unnecessary re-layout churn during window resizing.
+        try:
+            current = int(self.log_box.cget("height"))
+        except Exception:
+            current = None
+        if current is not None and current == target:
+            return
         self.log_box.configure(height=target)
 
     def append(self, message: str) -> None:

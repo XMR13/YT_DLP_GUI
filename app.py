@@ -4,8 +4,12 @@ from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Dict, List, Optional, Tuple
+import sys
+import ctypes
+import shutil
 
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import filedialog, messagebox
 from urllib.parse import parse_qs, urlparse
 
@@ -21,10 +25,11 @@ from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
 
 
 class App(ctk.CTk):
-    SCROLL_SPEED = 20
+    SCROLL_SPEED = 100
     STATUS_MIN_HEIGHT = 160
     STATUS_MAX_HEIGHT = 260
     PLAYLIST_AUTO_FETCH_DELAY_MS = 250
+    RESIZE_REDRAW_DELAY_MS = 120
     def __init__(self) -> None:
         super().__init__()
 
@@ -43,10 +48,14 @@ class App(ctk.CTk):
         self._current_info: Dict = {}
         self._current_task: Optional[str] = None
         self._solver_warning_shown = False
-        self._layout_job: Optional[str] = None
         self._auto_fetch_job: Optional[str] = None
         self._expected_formats_request_id: Optional[int] = None
         self._warning_once: set[str] = set()
+        self._content_scroll_job: Optional[str] = None
+        self._content_last_height: Optional[int] = None
+        self._resize_redraw_job: Optional[str] = None
+        self._resize_redraw_disabled = False
+        self._wheel_remainders: Dict[object, float] = {}
 
         self.url_var = ctk.StringVar()
         self.playlist_url_var = ctk.StringVar()
@@ -75,11 +84,31 @@ class App(ctk.CTk):
         self._body = ctk.CTkFrame(self, corner_radius=18)
         self._body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        self._content = ctk.CTkScrollableFrame(self._body, corner_radius=0, fg_color="transparent")
-        self._content.pack(fill="both", expand=True)
+        self._content_container = ctk.CTkFrame(self._body, corner_radius=0, fg_color="transparent")
+        self._content_container.pack(fill="both", expand=True)
+        self._content_container.grid_rowconfigure(0, weight=1)
+        self._content_container.grid_columnconfigure(0, weight=1)
+
+        self._content_canvas = tk.Canvas(self._content_container, highlightthickness=0, bd=0)
+        self._content_canvas.configure(yscrollincrement=1)
+        self._content_scrollbar = ctk.CTkScrollbar(
+            self._content_container,
+            orientation="vertical",
+            command=self._content_canvas.yview,
+        )
+        self._content_canvas.configure(yscrollcommand=self._content_scrollbar.set)
+        self._content_canvas.grid(row=0, column=0, sticky="nsew")
+        self._content_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._apply_canvas_bg(self._content_canvas, self._body.cget("fg_color"))
+
+        self._content = ctk.CTkFrame(self._content_canvas, corner_radius=0, fg_color="transparent")
+        self._content_window = self._content_canvas.create_window((0, 0), window=self._content, anchor="nw")
+        self._content.grid_columnconfigure(0, weight=1)
+        self._content.bind("<Configure>", self._schedule_content_scrollregion)
+        self._content_canvas.bind("<Configure>", self._on_content_canvas_configure)
 
         self.tabview = ctk.CTkTabview(self._content)
-        self.tabview.pack(fill="x", padx=18, pady=18)
+        self.tabview.grid(row=0, column=0, sticky="ew", padx=18, pady=18)
 
         single_tab = self.tabview.add("Single")
         playlist_tab = self.tabview.add("Playlist")
@@ -120,10 +149,10 @@ class App(ctk.CTk):
             on_choose_output=self._choose_output_dir,
             on_choose_runtime_path=self._choose_runtime_path,
         )
-        self.options_panel.pack(fill="x", padx=18, pady=(0, 18))
+        self.options_panel.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 18))
 
         self.info_panel = InfoPanel(self._content)
-        self.info_panel.pack(fill="x", padx=18, pady=(0, 18))
+        self.info_panel.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 18))
 
         self.preview_panel = PlaylistPreviewPanel(
             playlist_tab,
@@ -131,13 +160,20 @@ class App(ctk.CTk):
         )
         self.preview_panel.pack(fill="x", padx=18, pady=(0, 18))
         self.preview_panel.set_items([])
+        preview_canvas = self.preview_panel.get_scroll_canvas()
+        if preview_canvas:
+            try:
+                preview_canvas.configure(yscrollincrement=1)
+            except Exception:
+                pass
 
         self.status_panel = StatusPanel(
             self._content,
             min_height=self.STATUS_MIN_HEIGHT,
             max_height=self.STATUS_MAX_HEIGHT,
         )
-        self.status_panel.pack(fill="x", padx=18, pady=(0, 18))
+        self.status_panel.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        self._content.grid_rowconfigure(3, weight=1)
         self._append_log("Ready.")
 
         self._progress_targets = [
@@ -145,29 +181,34 @@ class App(ctk.CTk):
             (self.playlist_form_panel.progress, self.playlist_form_panel.progress_label),
         ]
         self._set_playlist_selection_state(False)
-        self._body.bind("<Configure>", self._schedule_layout_update)
-        self._schedule_layout_update()
+        self.bind("<Configure>", self._on_root_configure, add="+")
         self._bind_global_scroll_events()
 
     def _bind_global_scroll_events(self) -> None:
         def on_mousewheel(event: object) -> None:
-            delta = 0
+            delta = 0.0
             wheel_delta = int(getattr(event, "delta", 0))
             if wheel_delta:
-                delta = int(-1 * (wheel_delta / 120))
-                if delta == 0:
-                    delta = -1 if wheel_delta > 0 else 1
+                delta = (-wheel_delta / 120.0) * self.SCROLL_SPEED
             elif getattr(event, "num", None) == 4:
-                delta = -1
+                delta = -float(self.SCROLL_SPEED)
             elif getattr(event, "num", None) == 5:
-                delta = 1
+                delta = float(self.SCROLL_SPEED)
             if not delta:
                 return
             widget = self.winfo_containing(event.x_root, event.y_root)
             canvas = self._resolve_scroll_canvas(widget)
             if canvas is None:
                 return
-            canvas.yview_scroll(delta * max(1, self.SCROLL_SPEED), "units")
+            remainder = self._wheel_remainders.get(canvas, 0.0) + delta
+            step = int(remainder)
+            if step != 0:
+                try:
+                    canvas.yview_scroll(step, "units")
+                except Exception:
+                    return
+                remainder -= step
+            self._wheel_remainders[canvas] = remainder
 
         self.bind_all("<MouseWheel>", on_mousewheel)
         self.bind_all("<Button-4>", on_mousewheel)
@@ -178,11 +219,7 @@ class App(ctk.CTk):
             preview_frame = self.preview_panel.get_scroll_frame()
             if self._is_descendant(widget, preview_frame):
                 return self.preview_panel.get_scroll_canvas()
-        return self._get_scroll_canvas(self._content)
-
-    @staticmethod
-    def _get_scroll_canvas(scrollable: ctk.CTkScrollableFrame) -> Optional[object]:
-        return getattr(scrollable, "_parent_canvas", None) or getattr(scrollable, "_canvas", None)
+        return self._content_canvas
 
     @staticmethod
     def _is_descendant(widget: ctk.CTkBaseClass, ancestor: ctk.CTkBaseClass) -> bool:
@@ -199,26 +236,78 @@ class App(ctk.CTk):
                 return False
         return False
 
-    def _schedule_layout_update(self, _event: object | None = None) -> None:
-        if self._layout_job:
-            self.after_cancel(self._layout_job)
-        self._layout_job = self.after(60, self._apply_dynamic_layout)
+    def _schedule_content_scrollregion(self, _event: object | None = None) -> None:
+        if self._content_scroll_job:
+            self.after_cancel(self._content_scroll_job)
+        self._content_scroll_job = self.after_idle(self._update_content_scrollregion)
 
-    def _apply_dynamic_layout(self) -> None:
-        self._layout_job = None
-        if not self._content.winfo_exists():
+    def _update_content_scrollregion(self) -> None:
+        self._content_scroll_job = None
+        if not self._content_canvas.winfo_exists():
             return
-        view_height = self._content.winfo_height()
-        if view_height <= 1:
-            self._layout_job = self.after(60, self._apply_dynamic_layout)
+        height = self._content.winfo_reqheight()
+        if self._content_last_height == height:
             return
-        fixed = (
-            self.tabview.winfo_height()
-            + self.options_panel.winfo_height()
-            + self.info_panel.winfo_height()
-        )
-        available = view_height - fixed - 60
-        self.status_panel.set_height(available)
+        self._content_last_height = height
+        try:
+            self._content_canvas.configure(scrollregion=self._content_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_content_canvas_configure(self, _event: object) -> None:
+        try:
+            width = self._content_canvas.winfo_width()
+            self._content_canvas.itemconfigure(self._content_window, width=width)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _apply_canvas_bg(canvas: tk.Canvas, color: object) -> None:
+        if isinstance(color, (tuple, list)) and len(color) >= 2:
+            mode = ctk.get_appearance_mode()
+            color_value = color[0] if mode == "Light" else color[1]
+        else:
+            color_value = color
+        try:
+            canvas.configure(bg=color_value)
+        except Exception:
+            pass
+
+
+
+    def _on_root_configure(self, _event: object) -> None:
+        if not sys.platform.startswith("win"):
+            return
+        if not self._resize_redraw_disabled:
+            self._set_window_redraw(False)
+            self._resize_redraw_disabled = True
+        if self._resize_redraw_job:
+            self.after_cancel(self._resize_redraw_job)
+        self._resize_redraw_job = self.after(self.RESIZE_REDRAW_DELAY_MS, self._resume_window_redraw)
+
+    def _resume_window_redraw(self) -> None:
+        self._resize_redraw_job = None
+        if self._resize_redraw_disabled:
+            self._set_window_redraw(True)
+            self._resize_redraw_disabled = False
+
+    def _set_window_redraw(self, enabled: bool) -> None:
+        try:
+            hwnd = int(self.winfo_id())
+        except Exception:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            WM_SETREDRAW = 0x000B
+            RDW_INVALIDATE = 0x0001
+            RDW_UPDATENOW = 0x0100
+            RDW_ALLCHILDREN = 0x0080
+            user32.SendMessageW(hwnd, WM_SETREDRAW, 1 if enabled else 0, 0)
+            if enabled:
+                user32.RedrawWindow(hwnd, 0, 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN)
+        except Exception:
+            pass
+
 
     def _check_yt_dlp(self) -> None:
         if not self._adapter.check_available():
@@ -430,7 +519,13 @@ class App(ctk.CTk):
 
     def _normalize_js_runtime(self) -> Optional[str]:
         choice = self.js_runtime_var.get().strip()
-        return None if choice.lower() == "auto" else choice
+        if choice.lower() != "auto":
+            return choice
+        # Auto: prefer node, then deno, then bun if installed.
+        for candidate in ("node", "deno", "bun"):
+            if shutil.which(candidate):
+                return candidate
+        return None
 
     def _normalize_runtime_path(self) -> Optional[str]:
         path = self.js_runtime_path_var.get().strip()
@@ -445,7 +540,14 @@ class App(ctk.CTk):
     def _resolve_playlist_mode(self, url: str) -> bool:
         try:
             query = parse_qs(urlparse(url).query)
-            return "list" in query
+            list_values = query.get("list") or []
+            if not list_values:
+                return False
+            list_id = str(list_values[0])
+            # YouTube mixes use list ids like RD..., treat them as single videos by default.
+            if list_id.startswith(("RD", "RDCM", "RDMM", "RDUA", "RDGMEM")):
+                return False
+            return True
         except ValueError:
             return False
 
