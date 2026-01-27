@@ -77,7 +77,6 @@ class App(ctk.CTk):
 
         self._content = ctk.CTkScrollableFrame(self._body, corner_radius=0, fg_color="transparent")
         self._content.pack(fill="both", expand=True)
-        self._bind_scroll_events(self._content, speed=self.SCROLL_SPEED)
 
         self.tabview = ctk.CTkTabview(self._content)
         self.tabview.pack(fill="x", padx=18, pady=18)
@@ -129,7 +128,6 @@ class App(ctk.CTk):
         self.preview_panel = PlaylistPreviewPanel(
             playlist_tab,
             on_select=self._on_playlist_item_selected,
-            scroll_speed=self.SCROLL_SPEED,
         )
         self.preview_panel.pack(fill="x", padx=18, pady=(0, 18))
         self.preview_panel.set_items([])
@@ -149,13 +147,9 @@ class App(ctk.CTk):
         self._set_playlist_selection_state(False)
         self._body.bind("<Configure>", self._schedule_layout_update)
         self._schedule_layout_update()
+        self._bind_global_scroll_events()
 
-    @staticmethod
-    def _bind_scroll_events(scrollable: ctk.CTkScrollableFrame, speed: int = 5) -> None:
-        canvas = getattr(scrollable, "_parent_canvas", None) or getattr(scrollable, "_canvas", None)
-        if canvas is None:
-            return
-
+    def _bind_global_scroll_events(self) -> None:
         def on_mousewheel(event: object) -> None:
             delta = 0
             wheel_delta = int(getattr(event, "delta", 0))
@@ -167,21 +161,43 @@ class App(ctk.CTk):
                 delta = -1
             elif getattr(event, "num", None) == 5:
                 delta = 1
-            if delta:
-                canvas.yview_scroll(delta * max(1, speed), "units")
+            if not delta:
+                return
+            widget = self.winfo_containing(event.x_root, event.y_root)
+            canvas = self._resolve_scroll_canvas(widget)
+            if canvas is None:
+                return
+            canvas.yview_scroll(delta * max(1, self.SCROLL_SPEED), "units")
 
-        def bind_to_mousewheel(_event: object) -> None:
-            scrollable.bind_all("<MouseWheel>", on_mousewheel)
-            scrollable.bind_all("<Button-4>", on_mousewheel)
-            scrollable.bind_all("<Button-5>", on_mousewheel)
+        self.bind_all("<MouseWheel>", on_mousewheel)
+        self.bind_all("<Button-4>", on_mousewheel)
+        self.bind_all("<Button-5>", on_mousewheel)
 
-        def unbind_from_mousewheel(_event: object) -> None:
-            scrollable.unbind_all("<MouseWheel>")
-            scrollable.unbind_all("<Button-4>")
-            scrollable.unbind_all("<Button-5>")
+    def _resolve_scroll_canvas(self, widget: Optional[ctk.CTkBaseClass]) -> Optional[object]:
+        if widget and self.preview_panel:
+            preview_frame = self.preview_panel.get_scroll_frame()
+            if self._is_descendant(widget, preview_frame):
+                return self.preview_panel.get_scroll_canvas()
+        return self._get_scroll_canvas(self._content)
 
-        scrollable.bind("<Enter>", bind_to_mousewheel)
-        scrollable.bind("<Leave>", unbind_from_mousewheel)
+    @staticmethod
+    def _get_scroll_canvas(scrollable: ctk.CTkScrollableFrame) -> Optional[object]:
+        return getattr(scrollable, "_parent_canvas", None) or getattr(scrollable, "_canvas", None)
+
+    @staticmethod
+    def _is_descendant(widget: ctk.CTkBaseClass, ancestor: ctk.CTkBaseClass) -> bool:
+        current: Optional[ctk.CTkBaseClass] = widget
+        while current:
+            if current == ancestor:
+                return True
+            parent = current.winfo_parent()
+            if not parent:
+                return False
+            try:
+                current = current.nametowidget(parent)
+            except Exception:
+                return False
+        return False
 
     def _schedule_layout_update(self, _event: object | None = None) -> None:
         if self._layout_job:

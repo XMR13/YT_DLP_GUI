@@ -17,11 +17,9 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self,
         master: ctk.CTk,
         on_select: Optional[Callable[[PlaylistItem], None]] = None,
-        scroll_speed: int = 1,
         **kwargs: object,
     ) -> None:
         super().__init__(master, corner_radius=12, **kwargs)
-        self._scroll_speed = max(1, int(scroll_speed))
 
         title = ctk.CTkLabel(self, text="Playlist preview (first 20)")
         title.pack(anchor="w", padx=12, pady=(12, 6))
@@ -39,39 +37,12 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._selected_color = ("#D6D6D6", "#3A3A3A")
         self._row_meta: Dict[int, ctk.CTkLabel] = {}
         self._row_duration: Dict[int, str] = {}
-        self._bind_scroll_events()
 
-    def _bind_scroll_events(self) -> None:
-        canvas = getattr(self._list_frame, "_parent_canvas", None) or getattr(self._list_frame, "_canvas", None)
-        if canvas is None:
-            return
+    def get_scroll_frame(self) -> ctk.CTkScrollableFrame:
+        return self._list_frame
 
-        def on_mousewheel(event: object) -> None:
-            delta = 0
-            wheel_delta = int(getattr(event, "delta", 0))
-            if wheel_delta:
-                delta = int(-1 * (wheel_delta / 120))
-                if delta == 0:
-                    delta = -1 if wheel_delta > 0 else 1
-            elif getattr(event, "num", None) == 4:
-                delta = -1
-            elif getattr(event, "num", None) == 5:
-                delta = 1
-            if delta:
-                canvas.yview_scroll(delta * self._scroll_speed, "units")
-
-        def bind_to_mousewheel(_event: object) -> None:
-            self._list_frame.bind_all("<MouseWheel>", on_mousewheel)
-            self._list_frame.bind_all("<Button-4>", on_mousewheel)
-            self._list_frame.bind_all("<Button-5>", on_mousewheel)
-
-        def unbind_from_mousewheel(_event: object) -> None:
-            self._list_frame.unbind_all("<MouseWheel>")
-            self._list_frame.unbind_all("<Button-4>")
-            self._list_frame.unbind_all("<Button-5>")
-
-        self._list_frame.bind("<Enter>", bind_to_mousewheel)
-        self._list_frame.bind("<Leave>", unbind_from_mousewheel)
+    def get_scroll_canvas(self) -> Optional[object]:
+        return getattr(self._list_frame, "_parent_canvas", None) or getattr(self._list_frame, "_canvas", None)
 
     def set_items(self, items: List[PlaylistItem]) -> None:
         for item in self._items:
