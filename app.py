@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Dict, List, Optional, Tuple
@@ -48,9 +49,11 @@ class App(ctk.CTk):
         self.js_runtime_path_var = ctk.StringVar(value="")
         self.remote_components_var = ctk.StringVar(value="ejs:github")
 
+        self._log_file = self._init_log_file()
         self._build_ui()
         self._poll_events()
         self._check_yt_dlp()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.format_type_var.trace_add("write", self._on_selection_change)
         self.resolution_var.trace_add("write", self._on_selection_change)
@@ -277,6 +280,10 @@ class App(ctk.CTk):
             )
             self._append_log(hint)
         self.status_panel.append(message)
+        if self._log_file:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._log_file.write(f"[{timestamp}] {message}\n")
+            self._log_file.flush()
 
     def _update_progress(self, value: float) -> None:
         value = max(0.0, min(1.0, value))
@@ -372,6 +379,24 @@ class App(ctk.CTk):
         except Empty:
             pass
         self.after(200, self._poll_events)
+
+    def _init_log_file(self) -> Optional[object]:
+        try:
+            logs_dir = Path(__file__).resolve().parent / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = logs_dir / f"yt-dlp-gui_{stamp}.log"
+            return log_path.open("a", encoding="utf-8")
+        except OSError:
+            return None
+
+    def _on_close(self) -> None:
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+        self.destroy()
 
 
 def main() -> None:
