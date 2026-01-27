@@ -22,6 +22,17 @@ class FormatOption:
     tbr: Optional[float]
 
 
+@dataclass(frozen=True)
+class PlaylistItem:
+    index: int
+    title: str
+    webpage_url: Optional[str]
+    id: Optional[str]
+    ie_key: Optional[str]
+    thumbnail_url: Optional[str]
+    duration: Optional[int]
+
+
 class YtDlpAdapter:
     def __init__(
         self,
@@ -49,6 +60,7 @@ class YtDlpAdapter:
         self,
         url: str,
         playlist_mode: bool,
+        playlist_items: Optional[str] = None,
         cookies_from_browser: Optional[str] = None,
         js_runtime: Optional[str] = None,
         js_runtime_path: Optional[str] = None,
@@ -56,7 +68,8 @@ class YtDlpAdapter:
     ) -> Dict:
         args = ["yt-dlp", "-J", url]
         if playlist_mode:
-            args.extend(["--playlist-items", "1"])
+            items = playlist_items or "1"
+            args.extend(["--playlist-items", items])
         else:
             args.append("--no-playlist")
 
@@ -90,7 +103,7 @@ class YtDlpAdapter:
         js_runtime: Optional[str] = None,
         js_runtime_path: Optional[str] = None,
         remote_components: Optional[str] = None,
-    ) -> List[str]:
+    ) -> List[PlaylistItem]:
         end = max(1, limit)
         items_arg = f"1:{end}"
         args = [
@@ -119,13 +132,30 @@ class YtDlpAdapter:
 
         info = json.loads(result.stdout)
         entries = info.get("entries") or []
-        titles: List[str] = []
-        for entry in entries:
-            if isinstance(entry, dict):
-                title = entry.get("title")
-                if title:
-                    titles.append(str(title))
-        return titles
+        items: List[PlaylistItem] = []
+        for index, entry in enumerate(entries, start=1):
+            if not isinstance(entry, dict):
+                continue
+            title = str(entry.get("title") or f"Item {index}")
+            webpage_url = entry.get("url") or entry.get("webpage_url")
+            entry_id = entry.get("id")
+            ie_key = entry.get("ie_key") or entry.get("extractor_key")
+            duration = entry.get("duration")
+            thumbnail_url = entry.get("thumbnail") or entry.get("thumbnails", [{}])[-1].get("url")
+            if not thumbnail_url:
+                thumbnail_url = self._derive_thumbnail_url(ie_key, entry_id)
+            items.append(
+                PlaylistItem(
+                    index=index,
+                    title=title,
+                    webpage_url=str(webpage_url) if webpage_url else None,
+                    id=str(entry_id) if entry_id else None,
+                    ie_key=str(ie_key) if ie_key else None,
+                    thumbnail_url=thumbnail_url,
+                    duration=int(duration) if isinstance(duration, (int, float)) else None,
+                )
+            )
+        return items
 
     def extract_video_formats(self, info: Dict) -> List[FormatOption]:
         formats = info.get("formats") or []
@@ -135,7 +165,7 @@ class YtDlpAdapter:
             if fmt.get("vcodec") in (None, "none"):
                 continue
             height = fmt.get("height")
-            fps = fmt.get("fps")
+            fps = self._infer_fps(fmt)
             ext = fmt.get("ext")
             key = (height, fps, ext)
             current = grouped.get(key)
@@ -169,6 +199,7 @@ class YtDlpAdapter:
         format_id: Optional[str],
         audio_only: bool,
         playlist_mode: bool,
+        playlist_items: Optional[str] = None,
         cookies_from_browser: Optional[str] = None,
         js_runtime: Optional[str] = None,
         js_runtime_path: Optional[str] = None,
@@ -194,6 +225,8 @@ class YtDlpAdapter:
 
         if playlist_mode:
             args.append("--yes-playlist")
+            if playlist_items:
+                args.extend(["--playlist-items", playlist_items])
         else:
             args.append("--no-playlist")
 
@@ -266,6 +299,14 @@ class YtDlpAdapter:
             percent = float(match.group(1)) / 100.0
             self._progress(max(0.0, min(1.0, percent)))
 
+    @staticmethod
+    def _derive_thumbnail_url(ie_key: Optional[str], entry_id: Optional[str]) -> Optional[str]:
+        if not entry_id or not ie_key:
+            return None
+        if ie_key.lower() in {"youtube", "youtube:tab"}:
+            return f"https://i.ytimg.com/vi/{entry_id}/hqdefault.jpg"
+        return None
+
     def check_runtime(self, runtime: str, runtime_path: Optional[str]) -> Tuple[bool, str]:
         binary = runtime_path or runtime
         try:
@@ -308,3 +349,41 @@ class YtDlpAdapter:
             args.extend(["--js-runtimes", runtime_arg])
             if remote_components:
                 args.extend(["--remote-components", remote_components])
+
+    @staticmethod
+    def _infer_fps(fmt: Dict) -> Optional[float]:
+        fps = fmt.get("fps")
+        if isinstance(fps, (int, float)):
+            return float(fps)
+
+        candidates = [
+            fmt.get("format_note"),
+            fmt.get("format"),
+            fmt.get("format_id"),
+        ]
+        text = " ".join(str(value) for value in candidates if value)
+        if not text:
+            return None
+
+        match = re.search(r"(\d+(?:\.\d+)?)\s*fps", text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+
+        match = re.search(r"\b(\d{3,4})p(\d{2,3})\b", text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(2))
+            except ValueError:
+                return None
+
+        match = re.search(r"\b(\d{3,4})p\s*(\d{2,3})\b", text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(2))
+            except ValueError:
+                return None
+
+        return None

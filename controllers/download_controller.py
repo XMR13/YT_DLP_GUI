@@ -4,7 +4,7 @@ import threading
 from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
-from yt_dlp_adapter import FormatOption, YtDlpAdapter
+from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
 
 
 EventQueue = Queue[Tuple[str, object]]
@@ -21,15 +21,24 @@ class DownloadController:
         self,
         url: str,
         playlist_mode: bool,
-        cookies: Optional[str],
-        js_runtime: Optional[str],
-        js_runtime_path: Optional[str],
-        remote_components: Optional[str],
+        playlist_items: Optional[str] = None,
+        cookies: Optional[str] = None,
+        js_runtime: Optional[str] = None,
+        js_runtime_path: Optional[str] = None,
+        remote_components: Optional[str] = None,
     ) -> None:
         self._events.put(("busy", (True, "fetch")))
         threading.Thread(
             target=self._fetch_formats_worker,
-            args=(url, playlist_mode, cookies, js_runtime, js_runtime_path, remote_components),
+            args=(
+                url,
+                playlist_mode,
+                playlist_items,
+                cookies,
+                js_runtime,
+                js_runtime_path,
+                remote_components,
+            ),
             daemon=True,
         ).start()
 
@@ -55,10 +64,11 @@ class DownloadController:
         format_id: Optional[str],
         audio_only: bool,
         playlist_mode: bool,
-        cookies: Optional[str],
-        js_runtime: Optional[str],
-        js_runtime_path: Optional[str],
-        remote_components: Optional[str],
+        playlist_items: Optional[str] = None,
+        cookies: Optional[str] = None,
+        js_runtime: Optional[str] = None,
+        js_runtime_path: Optional[str] = None,
+        remote_components: Optional[str] = None,
     ) -> None:
         self._cancel_requested = False
         self._active_output_dir = output_dir
@@ -72,6 +82,7 @@ class DownloadController:
                 format_id,
                 audio_only,
                 playlist_mode,
+                playlist_items,
                 cookies,
                 js_runtime,
                 js_runtime_path,
@@ -88,6 +99,7 @@ class DownloadController:
         self,
         url: str,
         playlist_mode: bool,
+        playlist_items: Optional[str],
         cookies: Optional[str],
         js_runtime: Optional[str],
         js_runtime_path: Optional[str],
@@ -97,6 +109,7 @@ class DownloadController:
             info = self._adapter.fetch_info(
                 url,
                 playlist_mode,
+                playlist_items,
                 cookies,
                 js_runtime,
                 js_runtime_path,
@@ -119,6 +132,7 @@ class DownloadController:
         format_id: Optional[str],
         audio_only: bool,
         playlist_mode: bool,
+        playlist_items: Optional[str],
         cookies: Optional[str],
         js_runtime: Optional[str],
         js_runtime_path: Optional[str],
@@ -131,6 +145,7 @@ class DownloadController:
                 format_id=format_id,
                 audio_only=audio_only,
                 playlist_mode=playlist_mode,
+                playlist_items=playlist_items,
                 cookies_from_browser=cookies,
                 js_runtime=js_runtime,
                 js_runtime_path=js_runtime_path,
@@ -155,7 +170,7 @@ class DownloadController:
         limit: int,
     ) -> None:
         try:
-            items = self._adapter.fetch_playlist_preview(
+            items: List[PlaylistItem] = self._adapter.fetch_playlist_preview(
                 url,
                 limit=limit,
                 cookies_from_browser=cookies,

@@ -14,9 +14,10 @@ from ui.form_panel import FormPanel
 from ui.header import Header
 from ui.info_panel import InfoPanel
 from ui.options_panel import OptionsPanel
+from ui.playlist_form_panel import PlaylistFormPanel
 from ui.playlist_preview import PlaylistPreviewPanel
 from ui.status_panel import StatusPanel
-from yt_dlp_adapter import FormatOption, YtDlpAdapter
+from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
 
 
 class App(ctk.CTk):
@@ -40,7 +41,7 @@ class App(ctk.CTk):
         self._solver_warning_shown = False
 
         self.url_var = ctk.StringVar()
-        self.playlist_var = ctk.BooleanVar(value=False)
+        self.playlist_url_var = ctk.StringVar()
         self.format_type_var = ctk.StringVar(value="Video + Audio")
         self.resolution_var = ctk.StringVar(value="Best available")
         self.output_dir_var = ctk.StringVar(value=str(Path.cwd()))
@@ -48,6 +49,7 @@ class App(ctk.CTk):
         self.js_runtime_var = ctk.StringVar(value="Auto")
         self.js_runtime_path_var = ctk.StringVar(value="")
         self.remote_components_var = ctk.StringVar(value="ejs:github")
+        self._selected_playlist_item: Optional[PlaylistItem] = None
 
         self._log_file = self._init_log_file()
         self._build_ui()
@@ -57,7 +59,6 @@ class App(ctk.CTk):
 
         self.format_type_var.trace_add("write", self._on_selection_change)
         self.resolution_var.trace_add("write", self._on_selection_change)
-        self.playlist_var.trace_add("write", self._on_playlist_toggle)
 
     def _build_ui(self) -> None:
         header = Header(self)
@@ -66,16 +67,35 @@ class App(ctk.CTk):
         body = ctk.CTkFrame(self, corner_radius=18)
         body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
+        self.tabview = ctk.CTkTabview(body)
+        self.tabview.pack(fill="x", padx=18, pady=18)
+
+        single_tab = self.tabview.add("Single")
+        playlist_tab = self.tabview.add("Playlist")
+
         self.form_panel = FormPanel(
-            body,
+            single_tab,
             url_var=self.url_var,
-            playlist_var=self.playlist_var,
-            on_fetch=self._on_fetch_formats,
-            on_download=self._on_download,
+            playlist_var=None,
+            on_fetch=self._on_fetch_single_formats,
+            on_download=self._on_download_single,
+            on_cancel=self._on_cancel,
+            on_diagnostics=self._on_diagnostics,
+            url_label_text="Video URL",
+        )
+        self.form_panel.pack(fill="x", padx=18, pady=18)
+
+        self.playlist_form_panel = PlaylistFormPanel(
+            playlist_tab,
+            url_var=self.playlist_url_var,
+            on_fetch=self._on_fetch_playlist,
+            on_fetch_selected=self._on_fetch_selected_formats,
+            on_download_selected=self._on_download_selected,
+            on_download_playlist=self._on_download_playlist,
             on_cancel=self._on_cancel,
             on_diagnostics=self._on_diagnostics,
         )
-        self.form_panel.pack(fill="x", padx=18, pady=18)
+        self.playlist_form_panel.pack(fill="x", padx=18, pady=(18, 10))
 
         self.options_panel = OptionsPanel(
             body,
@@ -94,13 +114,22 @@ class App(ctk.CTk):
         self.info_panel = InfoPanel(body)
         self.info_panel.pack(fill="x", padx=18, pady=(0, 18))
 
-        self.preview_panel = PlaylistPreviewPanel(body)
+        self.preview_panel = PlaylistPreviewPanel(
+            playlist_tab,
+            on_select=self._on_playlist_item_selected,
+        )
         self.preview_panel.pack(fill="x", padx=18, pady=(0, 18))
         self.preview_panel.set_items([])
 
         self.status_panel = StatusPanel(body)
         self.status_panel.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         self._append_log("Ready.")
+
+        self._progress_targets = [
+            (self.form_panel.progress, self.form_panel.progress_label),
+            (self.playlist_form_panel.progress, self.playlist_form_panel.progress_label),
+        ]
+        self._set_playlist_selection_state(False)
 
     def _check_yt_dlp(self) -> None:
         if not self._adapter.check_available():
@@ -113,6 +142,11 @@ class App(ctk.CTk):
         self.form_panel.download_button.configure(state=state)
         self.form_panel.cancel_button.configure(state="disabled")
         self.form_panel.diag_button.configure(state=state)
+        self.playlist_form_panel.fetch_button.configure(state=state)
+        self.playlist_form_panel.download_playlist_button.configure(state=state)
+        self.playlist_form_panel.diag_button.configure(state=state)
+        self.playlist_form_panel.cancel_button.configure(state="disabled")
+        self._set_playlist_selection_state(state == "normal" and self._selected_playlist_item is not None)
 
     def _choose_output_dir(self) -> None:
         folder = filedialog.askdirectory()
@@ -124,49 +158,40 @@ class App(ctk.CTk):
         if file_path:
             self.js_runtime_path_var.set(file_path)
 
-    def _on_fetch_formats(self) -> None:
+    def _on_fetch_single_formats(self) -> None:
         url = self.url_var.get().strip()
         if not url:
             messagebox.showwarning("Missing URL", "Please enter a URL first.")
             return
 
-        playlist_mode = self._resolve_playlist_mode(url)
-        if playlist_mode and not self.playlist_var.get():
-            self.playlist_var.set(True)
-            self._append_log("Detected playlist URL — enabling Playlist mode.")
+        if self._resolve_playlist_mode(url):
+            messagebox.showinfo("Playlist detected", "Use the Playlist tab for playlist URLs.")
+            self.playlist_url_var.set(url)
+            self.tabview.set("Playlist")
+            return
 
         self._set_busy(True, task="fetch")
         self._controller.fetch_formats(
             url=url,
-            playlist_mode=playlist_mode,
+            playlist_mode=False,
+            playlist_items=None,
             cookies=self._normalize_cookies(),
             js_runtime=self._normalize_js_runtime(),
             js_runtime_path=self._normalize_runtime_path(),
             remote_components=self._normalize_remote_components(),
         )
 
-        if playlist_mode:
-            self._controller.fetch_preview(
-                url=url,
-                cookies=self._normalize_cookies(),
-                js_runtime=self._normalize_js_runtime(),
-                js_runtime_path=self._normalize_runtime_path(),
-                remote_components=self._normalize_remote_components(),
-                limit=20,
-            )
-        else:
-            self.preview_panel.set_items([])
-
-    def _on_download(self) -> None:
+    def _on_download_single(self) -> None:
         url = self.url_var.get().strip()
         if not url:
             messagebox.showwarning("Missing URL", "Please enter a URL first.")
             return
 
-        playlist_mode = self._resolve_playlist_mode(url)
-        if playlist_mode and not self.playlist_var.get():
-            self.playlist_var.set(True)
-            self._append_log("Detected playlist URL — enabling Playlist mode.")
+        if self._resolve_playlist_mode(url):
+            messagebox.showinfo("Playlist detected", "Use the Playlist tab for playlist URLs.")
+            self.playlist_url_var.set(url)
+            self.tabview.set("Playlist")
+            return
 
         output_dir = self.output_dir_var.get().strip()
         if not output_dir:
@@ -179,7 +204,101 @@ class App(ctk.CTk):
             output_dir=output_dir,
             format_id=self._resolve_format_id(),
             audio_only=self.format_type_var.get() == "Audio only",
-            playlist_mode=playlist_mode,
+            playlist_mode=False,
+            playlist_items=None,
+            cookies=self._normalize_cookies(),
+            js_runtime=self._normalize_js_runtime(),
+            js_runtime_path=self._normalize_runtime_path(),
+            remote_components=self._normalize_remote_components(),
+        )
+
+    def _on_fetch_playlist(self) -> None:
+        url = self.playlist_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL", "Please enter a playlist URL first.")
+            return
+
+        self._selected_playlist_item = None
+        self._set_playlist_selection_state(False)
+        self.preview_panel.set_items([])
+        self._controller.fetch_preview(
+            url=url,
+            cookies=self._normalize_cookies(),
+            js_runtime=self._normalize_js_runtime(),
+            js_runtime_path=self._normalize_runtime_path(),
+            remote_components=self._normalize_remote_components(),
+            limit=20,
+        )
+
+    def _on_fetch_selected_formats(self) -> None:
+        if not self._selected_playlist_item:
+            messagebox.showwarning("No selection", "Please select a playlist item first.")
+            return
+
+        url = self.playlist_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL", "Please enter a playlist URL first.")
+            return
+
+        self._set_busy(True, task="fetch")
+        self._controller.fetch_formats(
+            url=url,
+            playlist_mode=True,
+            playlist_items=str(self._selected_playlist_item.index),
+            cookies=self._normalize_cookies(),
+            js_runtime=self._normalize_js_runtime(),
+            js_runtime_path=self._normalize_runtime_path(),
+            remote_components=self._normalize_remote_components(),
+        )
+
+    def _on_download_selected(self) -> None:
+        if not self._selected_playlist_item:
+            messagebox.showwarning("No selection", "Please select a playlist item first.")
+            return
+
+        url = self.playlist_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL", "Please enter a playlist URL first.")
+            return
+
+        output_dir = self.output_dir_var.get().strip()
+        if not output_dir:
+            messagebox.showwarning("Missing output", "Please choose an output folder.")
+            return
+
+        self._set_busy(True, task="download_item")
+        self._controller.start_download(
+            url=url,
+            output_dir=output_dir,
+            format_id=self._resolve_format_id(),
+            audio_only=self.format_type_var.get() == "Audio only",
+            playlist_mode=True,
+            playlist_items=str(self._selected_playlist_item.index),
+            cookies=self._normalize_cookies(),
+            js_runtime=self._normalize_js_runtime(),
+            js_runtime_path=self._normalize_runtime_path(),
+            remote_components=self._normalize_remote_components(),
+        )
+
+    def _on_download_playlist(self) -> None:
+        url = self.playlist_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL", "Please enter a playlist URL first.")
+            return
+
+        output_dir = self.output_dir_var.get().strip()
+        if not output_dir:
+            messagebox.showwarning("Missing output", "Please choose an output folder.")
+            return
+
+        self._set_busy(True, task="download_playlist")
+        self._controller.start_download(
+            url=url,
+            output_dir=output_dir,
+            format_id=self._resolve_format_id(),
+            audio_only=self.format_type_var.get() == "Audio only",
+            playlist_mode=True,
+            playlist_items=None,
             cookies=self._normalize_cookies(),
             js_runtime=self._normalize_js_runtime(),
             js_runtime_path=self._normalize_runtime_path(),
@@ -187,7 +306,7 @@ class App(ctk.CTk):
         )
 
     def _on_cancel(self) -> None:
-        if self._current_task != "download":
+        if self._current_task not in ("download", "download_item", "download_playlist"):
             return
         self._controller.cancel_download()
 
@@ -205,10 +324,6 @@ class App(ctk.CTk):
             self._append_log(f"{runtime}: {status} ({details})")
         else:
             self._append_log("JS runtime: Auto (no explicit runtime selected)")
-
-    def _on_playlist_toggle(self, *_args: object) -> None:
-        if not self.playlist_var.get():
-            self.preview_panel.set_items([])
 
     def _resolve_format_id(self) -> Optional[str]:
         if self.format_type_var.get() == "Audio only":
@@ -239,8 +354,6 @@ class App(ctk.CTk):
         return None if choice.lower() == "none" else choice
 
     def _resolve_playlist_mode(self, url: str) -> bool:
-        if self.playlist_var.get():
-            return True
         try:
             query = parse_qs(urlparse(url).query)
             return "list" in query
@@ -250,14 +363,30 @@ class App(ctk.CTk):
     def _on_selection_change(self, *_args: object) -> None:
         self._update_info_display()
 
+    def _on_playlist_item_selected(self, item: PlaylistItem) -> None:
+        self._selected_playlist_item = item
+        self._set_playlist_selection_state(True)
+        self._current_info = {"title": item.title, "duration": item.duration}
+        self._update_info_display()
+
+    def _set_playlist_selection_state(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.playlist_form_panel.fetch_selected_button.configure(state=state)
+        self.playlist_form_panel.download_selected_button.configure(state=state)
+
     def _set_busy(self, busy: bool, task: Optional[str] = None) -> None:
         state = "disabled" if busy else "normal"
         self.form_panel.fetch_button.configure(state=state)
         self.form_panel.download_button.configure(state=state)
         self.form_panel.diag_button.configure(state=state)
+        self.playlist_form_panel.fetch_button.configure(state=state)
+        self.playlist_form_panel.download_playlist_button.configure(state=state)
+        self.playlist_form_panel.diag_button.configure(state=state)
+        self._set_playlist_selection_state(not busy and self._selected_playlist_item is not None)
         self._current_task = task if busy else None
-        cancel_state = "normal" if busy and task == "download" else "disabled"
+        cancel_state = "normal" if busy and task in ("download", "download_item", "download_playlist") else "disabled"
         self.form_panel.cancel_button.configure(state=cancel_state)
+        self.playlist_form_panel.cancel_button.configure(state=cancel_state)
         if busy:
             self._append_log("Working...")
         else:
@@ -287,18 +416,20 @@ class App(ctk.CTk):
 
     def _update_progress(self, value: float) -> None:
         value = max(0.0, min(1.0, value))
-        self.form_panel.progress.set(value)
         percent = int(value * 100)
         label = f"{percent}%"
         if value == 0.0:
             label = "Idle"
         elif value >= 1.0:
             label = "Completed"
-        self.form_panel.progress_label.configure(text=label)
+        for bar, bar_label in self._progress_targets:
+            bar.set(value)
+            bar_label.configure(text=label)
 
     def _update_info_display(self) -> None:
         info = self._current_info or {}
         title = info.get("title") or "—"
+        duration = self._format_duration(info.get("duration"))
 
         if self.format_type_var.get() == "Audio only":
             resolution = "Audio only"
@@ -326,11 +457,24 @@ class App(ctk.CTk):
         self.info_panel.update_values(
             {
                 "title": title,
+                "duration": duration,
                 "resolution": resolution,
                 "format": fmt,
                 "size": size,
             }
         )
+
+    @staticmethod
+    def _format_duration(value: Optional[object]) -> str:
+        if not isinstance(value, (int, float)):
+            return "—"
+        total = int(value)
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        seconds = total % 60
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes}:{seconds:02d}"
 
     @staticmethod
     def _format_size(size_bytes: Optional[int]) -> str:
@@ -360,6 +504,10 @@ class App(ctk.CTk):
                     self._update_info_display()
                 elif event == "preview":
                     self.preview_panel.set_items(list(payload))  # type: ignore[arg-type]
+                    self._selected_playlist_item = None
+                    self._set_playlist_selection_state(False)
+                    self._current_info = {}
+                    self._update_info_display()
                 elif event == "info":
                     self._current_info = dict(payload)  # type: ignore[arg-type]
                     self._update_info_display()
