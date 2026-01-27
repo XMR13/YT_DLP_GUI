@@ -297,15 +297,14 @@ class YtDlpAdapter:
         js_runtime_path: Optional[str],
         remote_components: Optional[str],
     ) -> None:
+        # Ensure js runtime and remote-components flags are appended at most once.
+        runtime_arg: Optional[str] = None
         if js_runtime:
-            runtime_arg = js_runtime
-            if js_runtime_path:
-                runtime_arg = f"{js_runtime}:{js_runtime_path}"
+            runtime_arg = f"{js_runtime}:{js_runtime_path}" if js_runtime_path else js_runtime
+        elif js_runtime_path:
+            runtime_arg = js_runtime_path
+
+        if runtime_arg:
             args.extend(["--js-runtimes", runtime_arg])
             if remote_components:
                 args.extend(["--remote-components", remote_components])
-        elif js_runtime_path:
-            args.extend(["--js-runtimes", js_runtime_path])
-            if remote_components:
-                args.extend(["--remote-components", remote_components])
-            args.extend(["--remote-components", remote_components])
