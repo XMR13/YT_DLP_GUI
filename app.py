@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import sys
 import ctypes
 import shutil
+import threading
 
 import customtkinter as ctk
 import tkinter as tk
@@ -67,6 +68,7 @@ class App(ctk.CTk):
         self.js_runtime_path_var = ctk.StringVar(value="")
         self.remote_components_var = ctk.StringVar(value="ejs:github")
         self._selected_playlist_item: Optional[PlaylistItem] = None
+        self._selected_playlist_items: List[PlaylistItem] = []
 
         self._log_file = self._init_log_file()
         self._build_ui()
@@ -80,6 +82,7 @@ class App(ctk.CTk):
     def _build_ui(self) -> None:
         header = Header(self)
         header.pack(fill="x", padx=20, pady=(20, 10))
+        self._sync_root_bg(header.cget("fg_color"))
 
         self._body = ctk.CTkFrame(self, corner_radius=18)
         self._body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -156,7 +159,7 @@ class App(ctk.CTk):
 
         self.preview_panel = PlaylistPreviewPanel(
             playlist_tab,
-            on_select=self._on_playlist_item_selected,
+            on_select=self._on_playlist_selection_changed,
         )
         self.preview_panel.pack(fill="x", padx=18, pady=(0, 18))
         self.preview_panel.set_items([])
@@ -180,7 +183,7 @@ class App(ctk.CTk):
             (self.form_panel.progress, self.form_panel.progress_label),
             (self.playlist_form_panel.progress, self.playlist_form_panel.progress_label),
         ]
-        self._set_playlist_selection_state(False)
+        self._set_playlist_selection_state(False, False)
         self.bind("<Configure>", self._on_root_configure, add="+")
         self._bind_global_scroll_events()
 
@@ -266,13 +269,26 @@ class App(ctk.CTk):
 
     @staticmethod
     def _apply_canvas_bg(canvas: tk.Canvas, color: object) -> None:
-        if isinstance(color, (tuple, list)) and len(color) >= 2:
-            mode = ctk.get_appearance_mode()
-            color_value = color[0] if mode == "Light" else color[1]
-        else:
-            color_value = color
+        color_value = App._resolve_color(color)
         try:
             canvas.configure(bg=color_value)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _resolve_color(color: object) -> object:
+        if isinstance(color, (tuple, list)) and len(color) >= 2:
+            mode = ctk.get_appearance_mode()
+            return color[0] if mode == "Light" else color[1]
+        return color
+
+    def _sync_root_bg(self, color: object) -> None:
+        try:
+            self.configure(fg_color=color)
+        except Exception:
+            pass
+        try:
+            self.configure(bg=self._resolve_color(color))
         except Exception:
             pass
 
@@ -336,10 +352,16 @@ class App(ctk.CTk):
 
 
     def _check_yt_dlp(self) -> None:
-        if not self._adapter.check_available():
-            self._append_log("yt-dlp not found. Install it with: pip install yt-dlp")
-            self._set_controls_state("disabled")
-            messagebox.showerror("yt-dlp missing", "yt-dlp is not installed or not on PATH.")
+        def worker() -> None:
+            available = self._adapter.check_available()
+            if not available:
+                self.after(0, self._handle_missing_yt_dlp)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_missing_yt_dlp(self) -> None:
+        self._append_log("yt-dlp not found. Install it with: pip install yt-dlp")
+        self._set_controls_state("disabled")
+        messagebox.showerror("yt-dlp missing", "yt-dlp is not installed or not on PATH.")
 
     def _set_controls_state(self, state: str) -> None:
         self.form_panel.fetch_button.configure(state=state)
@@ -350,7 +372,10 @@ class App(ctk.CTk):
         self.playlist_form_panel.download_playlist_button.configure(state=state)
         self.playlist_form_panel.diag_button.configure(state=state)
         self.playlist_form_panel.cancel_button.configure(state="disabled")
-        self._set_playlist_selection_state(state == "normal" and self._selected_playlist_item is not None)
+        self._set_playlist_selection_state(
+            state == "normal" and bool(self._selected_playlist_items),
+            state == "normal" and self._selected_playlist_item is not None,
+        )
 
     def _choose_output_dir(self) -> None:
         folder = filedialog.askdirectory()
@@ -423,7 +448,8 @@ class App(ctk.CTk):
             return
 
         self._selected_playlist_item = None
-        self._set_playlist_selection_state(False)
+        self._selected_playlist_items = []
+        self._set_playlist_selection_state(False, False)
         self.preview_panel.set_items([])
         self._controller.fetch_preview(
             url=url,
@@ -456,8 +482,8 @@ class App(ctk.CTk):
         )
 
     def _on_download_selected(self) -> None:
-        if not self._selected_playlist_item:
-            messagebox.showwarning("No selection", "Please select a playlist item first.")
+        if not self._selected_playlist_items:
+            messagebox.showwarning("No selection", "Please select at least one playlist item.")
             return
 
         url = self.playlist_url_var.get().strip()
@@ -470,6 +496,7 @@ class App(ctk.CTk):
             messagebox.showwarning("Missing output", "Please choose an output folder.")
             return
 
+        items_arg = self._get_selected_playlist_items_arg()
         self._set_busy(True, task="download_item")
         self._controller.start_download(
             url=url,
@@ -477,7 +504,7 @@ class App(ctk.CTk):
             format_id=self._resolve_format_id(),
             audio_only=self.format_type_var.get() == "Audio only",
             playlist_mode=True,
-            playlist_items=str(self._selected_playlist_item.index),
+            playlist_items=items_arg,
             cookies=self._normalize_cookies(),
             js_runtime=self._normalize_js_runtime(),
             js_runtime_path=self._normalize_runtime_path(),
@@ -580,17 +607,33 @@ class App(ctk.CTk):
     def _on_selection_change(self, *_args: object) -> None:
         self._update_info_display()
 
-    def _on_playlist_item_selected(self, item: PlaylistItem) -> None:
-        self._selected_playlist_item = item
-        self._set_playlist_selection_state(True)
-        self._current_info = {"title": item.title, "duration": item.duration}
-        self._update_info_display()
-        self._schedule_auto_fetch_selected()
+    def _on_playlist_selection_changed(
+        self,
+        active_item: Optional[PlaylistItem],
+        selected_items: List[PlaylistItem],
+    ) -> None:
+        self._selected_playlist_item = active_item
+        self._selected_playlist_items = selected_items
+        self._set_playlist_selection_state(bool(selected_items), active_item is not None)
+        if active_item:
+            self._current_info = {"title": active_item.title, "duration": active_item.duration}
+            self._update_info_display()
+            self._schedule_auto_fetch_selected()
+        else:
+            self._current_info = {}
+            self._update_info_display()
 
-    def _set_playlist_selection_state(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
-        self.playlist_form_panel.fetch_selected_button.configure(state=state)
-        self.playlist_form_panel.download_selected_button.configure(state=state)
+    def _get_selected_playlist_items_arg(self) -> Optional[str]:
+        if not self._selected_playlist_items:
+            return None
+        indices = sorted({item.index for item in self._selected_playlist_items})
+        return ",".join(str(index) for index in indices)
+
+    def _set_playlist_selection_state(self, has_selection: bool, has_active: bool) -> None:
+        fetch_state = "normal" if has_active else "disabled"
+        download_state = "normal" if has_selection else "disabled"
+        self.playlist_form_panel.fetch_selected_button.configure(state=fetch_state)
+        self.playlist_form_panel.download_selected_button.configure(state=download_state)
 
     def _set_busy(self, busy: bool, task: Optional[str] = None) -> None:
         state = "disabled" if busy else "normal"
@@ -600,7 +643,10 @@ class App(ctk.CTk):
         self.playlist_form_panel.fetch_button.configure(state=state)
         self.playlist_form_panel.download_playlist_button.configure(state=state)
         self.playlist_form_panel.diag_button.configure(state=state)
-        self._set_playlist_selection_state(not busy and self._selected_playlist_item is not None)
+        self._set_playlist_selection_state(
+            not busy and bool(self._selected_playlist_items),
+            not busy and self._selected_playlist_item is not None,
+        )
         self._current_task = task if busy else None
         cancel_state = "normal" if busy and task in ("download", "download_item", "download_playlist") else "disabled"
         self.form_panel.cancel_button.configure(state=cancel_state)
@@ -779,7 +825,8 @@ class App(ctk.CTk):
                 elif event == "preview":
                     self.preview_panel.set_items(list(payload))  # type: ignore[arg-type]
                     self._selected_playlist_item = None
-                    self._set_playlist_selection_state(False)
+                    self._selected_playlist_items = []
+                    self._set_playlist_selection_state(False, False)
                     self._current_info = {}
                     self._update_info_display()
                 elif event == "info":
