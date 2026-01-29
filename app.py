@@ -51,6 +51,7 @@ class App(ctk.CTk):
         self._solver_warning_shown = False
         self._auto_fetch_job: Optional[str] = None
         self._expected_formats_request_id: Optional[int] = None
+        self._expected_formats_index: Optional[int] = None
         self._warning_once: set[str] = set()
         self._content_scroll_job: Optional[str] = None
         self._content_last_height: Optional[int] = None
@@ -69,6 +70,12 @@ class App(ctk.CTk):
         self.remote_components_var = ctk.StringVar(value="ejs:github")
         self._selected_playlist_item: Optional[PlaylistItem] = None
         self._selected_playlist_items: List[PlaylistItem] = []
+        self._playlist_item_info_cache: Dict[int, Dict] = {}
+        self._playlist_item_formats_cache: Dict[int, List[FormatOption]] = {}
+        self._preview_page_size = 20
+        self._preview_loaded = 0
+        self._preview_total: Optional[int] = None
+        self._preview_loading = False
 
         self._log_file = self._init_log_file()
         self._build_ui()
@@ -160,9 +167,11 @@ class App(ctk.CTk):
         self.preview_panel = PlaylistPreviewPanel(
             playlist_tab,
             on_select=self._on_playlist_selection_changed,
+            on_load_more=self._on_load_more_preview,
         )
         self.preview_panel.pack(fill="x", padx=18, pady=(0, 18))
         self.preview_panel.set_items([])
+        self.preview_panel.set_load_more_state(False, "Load more")
         preview_canvas = self.preview_panel.get_scroll_canvas()
         if preview_canvas:
             try:
@@ -400,6 +409,7 @@ class App(ctk.CTk):
             return
 
         self._set_busy(True, task="fetch")
+        self._expected_formats_index = None
         self._expected_formats_request_id = self._controller.fetch_formats(
             url=url,
             playlist_mode=False,
@@ -449,15 +459,24 @@ class App(ctk.CTk):
 
         self._selected_playlist_item = None
         self._selected_playlist_items = []
+        self._playlist_item_info_cache.clear()
+        self._playlist_item_formats_cache.clear()
         self._set_playlist_selection_state(False, False)
         self.preview_panel.set_items([])
+        self._preview_page_size = 20
+        self._preview_loaded = 0
+        self._preview_total: Optional[int] = None
+        self._preview_loading = True
+        self.preview_panel.set_load_more_state(False, "Loading...")
         self._controller.fetch_preview(
             url=url,
             cookies=self._normalize_cookies(),
             js_runtime=self._normalize_js_runtime(),
             js_runtime_path=self._normalize_runtime_path(),
             remote_components=self._normalize_remote_components(),
-            limit=20,
+            start=1,
+            limit=self._preview_page_size,
+            append=False,
         )
 
     def _on_fetch_selected_formats(self) -> None:
@@ -470,7 +489,15 @@ class App(ctk.CTk):
             messagebox.showwarning("Missing URL", "Please enter a playlist URL first.")
             return
 
+        cached_formats = self._playlist_item_formats_cache.get(self._selected_playlist_item.index)
+        if cached_formats:
+            self._expected_formats_request_id = None
+            self._expected_formats_index = None
+            self._apply_formats(cached_formats)
+            return
+
         self._set_busy(True, task="fetch")
+        self._expected_formats_index = self._selected_playlist_item.index
         self._expected_formats_request_id = self._controller.fetch_formats(
             url=url,
             playlist_mode=True,
@@ -616,18 +643,66 @@ class App(ctk.CTk):
         self._selected_playlist_items = selected_items
         self._set_playlist_selection_state(bool(selected_items), active_item is not None)
         if active_item:
+            index = active_item.index
             self._current_info = {"title": active_item.title, "duration": active_item.duration}
-            self._update_info_display()
-            self._schedule_auto_fetch_selected()
+            cached_info = self._playlist_item_info_cache.get(index)
+            if cached_info:
+                self._current_info = dict(cached_info)
+                duration_value = cached_info.get("duration")
+                if isinstance(duration_value, (int, float)):
+                    self.preview_panel.update_item_duration(index, int(duration_value))
+            cached_formats = self._playlist_item_formats_cache.get(index)
+            if cached_formats:
+                self._expected_formats_request_id = None
+                self._expected_formats_index = None
+                self._apply_formats(cached_formats)
+            else:
+                self._update_info_display()
+                self._schedule_auto_fetch_selected()
         else:
             self._current_info = {}
             self._update_info_display()
+
+    def _on_load_more_preview(self) -> None:
+        if self._preview_loading:
+            return
+        if self._preview_total is not None and self._preview_loaded >= self._preview_total:
+            self.preview_panel.set_load_more_state(False, "All loaded")
+            return
+        url = self.playlist_url_var.get().strip()
+        if not url:
+            return
+        self._preview_loading = True
+        self.preview_panel.set_load_more_state(False, "Loading...")
+        start = self._preview_loaded + 1
+        self._controller.fetch_preview(
+            url=url,
+            cookies=self._normalize_cookies(),
+            js_runtime=self._normalize_js_runtime(),
+            js_runtime_path=self._normalize_runtime_path(),
+            remote_components=self._normalize_remote_components(),
+            start=start,
+            limit=self._preview_page_size,
+            append=True,
+        )
 
     def _get_selected_playlist_items_arg(self) -> Optional[str]:
         if not self._selected_playlist_items:
             return None
         indices = sorted({item.index for item in self._selected_playlist_items})
         return ",".join(str(index) for index in indices)
+
+    def _apply_formats(self, options: List[FormatOption]) -> None:
+        self._format_options = list(options)
+        self._format_map = {opt.label: opt for opt in self._format_options}
+        values = [opt.label for opt in self._format_options]
+        if values:
+            values.insert(0, "Best available")
+        else:
+            values = ["Best available"]
+        self.options_panel.resolution_menu.configure(values=values)
+        self.resolution_var.set(values[0])
+        self._update_info_display()
 
     def _set_playlist_selection_state(self, has_selection: bool, has_active: bool) -> None:
         fetch_state = "normal" if has_active else "disabled"
@@ -760,7 +835,14 @@ class App(ctk.CTk):
         url = self.playlist_url_var.get().strip()
         if not url:
             return
+        index = self._selected_playlist_item.index
+        if index in self._playlist_item_formats_cache:
+            self._expected_formats_request_id = None
+            self._expected_formats_index = None
+            self._apply_formats(self._playlist_item_formats_cache[index])
+            return
         self.preview_panel.update_selected_size("loading...")
+        self._expected_formats_index = self._selected_playlist_item.index
         self._expected_formats_request_id = self._controller.fetch_formats(
             url=url,
             playlist_mode=True,
@@ -812,23 +894,36 @@ class App(ctk.CTk):
                         request_id, options = payload
                     if request_id is not None and request_id != self._expected_formats_request_id:
                         continue
-                    self._format_options = list(options)  # type: ignore[arg-type]
-                    self._format_map = {opt.label: opt for opt in self._format_options}
-                    values = [opt.label for opt in self._format_options]
-                    if values:
-                        values.insert(0, "Best available")
-                    else:
-                        values = ["Best available"]
-                    self.options_panel.resolution_menu.configure(values=values)
-                    self.resolution_var.set(values[0])
-                    self._update_info_display()
+                    self._apply_formats(list(options))  # type: ignore[arg-type]
+                    if self._expected_formats_index is not None:
+                        self._playlist_item_formats_cache[self._expected_formats_index] = list(options)  # type: ignore[arg-type]
                 elif event == "preview":
-                    self.preview_panel.set_items(list(payload))  # type: ignore[arg-type]
-                    self._selected_playlist_item = None
-                    self._selected_playlist_items = []
-                    self._set_playlist_selection_state(False, False)
-                    self._current_info = {}
-                    self._update_info_display()
+                    items = payload
+                    total_count: Optional[int] = None
+                    append = False
+                    if isinstance(payload, tuple):
+                        if len(payload) == 3:
+                            items, total_count, append = payload
+                        elif len(payload) == 2:
+                            items, total_count = payload
+                    if append:
+                        self.preview_panel.append_items(list(items), total_count)  # type: ignore[arg-type]
+                        self._preview_loaded += len(items)  # type: ignore[arg-type]
+                    else:
+                        self.preview_panel.set_items(list(items), total_count)  # type: ignore[arg-type]
+                        self._preview_loaded = len(items)  # type: ignore[arg-type]
+                    self._preview_total = total_count
+                    self._preview_loading = False
+                    if self._preview_total is not None and self._preview_loaded >= self._preview_total:
+                        self.preview_panel.set_load_more_state(False, "All loaded")
+                    else:
+                        self.preview_panel.set_load_more_state(True, "Load more")
+                    if not append:
+                        self._selected_playlist_item = None
+                        self._selected_playlist_items = []
+                        self._set_playlist_selection_state(False, False)
+                        self._current_info = {}
+                        self._update_info_display()
                 elif event == "info":
                     request_id: Optional[int] = None
                     info = payload
@@ -838,6 +933,11 @@ class App(ctk.CTk):
                         continue
                     self._current_info = dict(info)  # type: ignore[arg-type]
                     self._update_info_display()
+                    if self._expected_formats_index is not None:
+                        self._playlist_item_info_cache[self._expected_formats_index] = dict(info)  # type: ignore[arg-type]
+                        duration_value = info.get("duration")
+                        if isinstance(duration_value, (int, float)):
+                            self.preview_panel.update_item_duration(self._expected_formats_index, int(duration_value))
                 elif event == "log":
                     self._append_log(str(payload))
                 elif event == "progress":
@@ -845,6 +945,9 @@ class App(ctk.CTk):
                 elif event == "error":
                     self._append_log(f"Error: {payload}")
                     messagebox.showerror("Error", str(payload))
+                    if self._preview_loading:
+                        self._preview_loading = False
+                        self.preview_panel.set_load_more_state(True, "Load more")
                 elif event == "busy":
                     if isinstance(payload, tuple):
                         busy, task = payload

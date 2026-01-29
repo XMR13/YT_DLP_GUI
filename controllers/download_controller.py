@@ -56,11 +56,13 @@ class DownloadController:
         js_runtime: Optional[str],
         js_runtime_path: Optional[str],
         remote_components: Optional[str],
+        start: int = 1,
         limit: int = 20,
+        append: bool = False,
     ) -> None:
         threading.Thread(
             target=self._fetch_preview_worker,
-            args=(url, cookies, js_runtime, js_runtime_path, remote_components, limit),
+            args=(url, cookies, js_runtime, js_runtime_path, remote_components, start, limit, append),
             daemon=True,
         ).start()
 
@@ -175,18 +177,21 @@ class DownloadController:
         js_runtime: Optional[str],
         js_runtime_path: Optional[str],
         remote_components: Optional[str],
+        start: int,
         limit: int,
+        append: bool,
     ) -> None:
         try:
-            items: List[PlaylistItem] = self._adapter.fetch_playlist_preview(
+            items, total_count = self._adapter.fetch_playlist_preview(
                 url,
+                start=start,
                 limit=limit,
                 cookies_from_browser=cookies,
                 js_runtime=js_runtime,
                 js_runtime_path=js_runtime_path,
                 remote_components=remote_components,
             )
-            self._events.put(("preview", items))
+            self._events.put(("preview", (items, total_count, append)))
             self._events.put(("log", f"Playlist preview loaded ({len(items)} items)."))
         except Exception as exc:  # noqa: BLE001
             self._events.put(("error", str(exc)))

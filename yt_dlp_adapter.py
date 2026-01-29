@@ -102,14 +102,16 @@ class YtDlpAdapter:
     def fetch_playlist_preview(
         self,
         url: str,
+        start: int = 1,
         limit: int = 20,
         cookies_from_browser: Optional[str] = None,
         js_runtime: Optional[str] = None,
         js_runtime_path: Optional[str] = None,
         remote_components: Optional[str] = None,
-    ) -> List[PlaylistItem]:
-        end = max(1, limit)
-        items_arg = f"1:{end}"
+    ) -> Tuple[List[PlaylistItem], Optional[int]]:
+        start_index = max(1, start)
+        end_index = max(start_index, start_index + max(1, limit) - 1)
+        items_arg = f"{start_index}:{end_index}"
         args = [
             "yt-dlp",
             "-J",
@@ -136,8 +138,14 @@ class YtDlpAdapter:
 
         info = json.loads(result.stdout)
         entries = info.get("entries") or []
+        total_count = None
+        for key in ("playlist_count", "n_entries", "total_entries", "playlist_entries"):
+            value = info.get(key)
+            if isinstance(value, int) and value > 0:
+                total_count = value
+                break
         items: List[PlaylistItem] = []
-        for index, entry in enumerate(entries, start=1):
+        for index, entry in enumerate(entries, start=start_index):
             if not isinstance(entry, dict):
                 continue
             title = str(entry.get("title") or f"Item {index}")
@@ -159,7 +167,9 @@ class YtDlpAdapter:
                     duration=int(duration) if isinstance(duration, (int, float)) else None,
                 )
             )
-        return items
+        if total_count is None:
+            total_count = len(items)
+        return items, total_count
 
     def extract_video_formats(self, info: Dict) -> List[FormatOption]:
         formats = info.get("formats") or []
