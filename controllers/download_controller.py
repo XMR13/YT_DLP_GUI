@@ -4,7 +4,7 @@ import threading
 from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
-from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
+from yt_dlp_adapter import DownloadCancelled, FormatOption, PlaylistItem, YtDlpAdapter
 
 
 EventQueue = Queue[Tuple[str, object]]
@@ -149,7 +149,7 @@ class DownloadController:
         remote_components: Optional[str],
     ) -> None:
         try:
-            self._adapter.download(
+            output_paths = self._adapter.download(
                 url=url,
                 output_dir=output_dir,
                 format_id=format_id,
@@ -161,12 +161,14 @@ class DownloadController:
                 js_runtime_path=js_runtime_path,
                 remote_components=remote_components,
             )
+            self._events.put(("download_complete", output_paths))
             self._events.put(("log", "Download completed."))
+        except DownloadCancelled:
+            self._events.put(("download_cancelled", None))
+            self._events.put(("log", "Download cancelled."))
         except Exception as exc:  # noqa: BLE001
-            if self._cancel_requested:
-                self._events.put(("log", "Download cancelled."))
-            else:
-                self._events.put(("error", str(exc)))
+            self._events.put(("download_error", str(exc)))
+            self._events.put(("error", str(exc)))
         finally:
             self._events.put(("busy", (False, None)))
 

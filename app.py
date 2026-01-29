@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 import sys
-import ctypes
+import os
 import shutil
+import subprocess
 import threading
 
 import customtkinter as ctk
@@ -15,15 +16,19 @@ from tkinter import filedialog, messagebox
 from urllib.parse import parse_qs, urlparse
 
 from controllers.download_controller import DownloadController
+from controllers.history_store import HistoryEntry, HistoryStore
 from ui.form_panel import FormPanel
 from ui.header import Header
 from ui.info_panel import InfoPanel
 from ui.options_panel import OptionsPanel
 from ui.playlist_form_panel import PlaylistFormPanel
-from ui.playlist_preview import PlaylistPreviewPanel
 from ui.status_panel import StatusPanel
 from ui.sidebar import SidebarNav
 from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
+
+if TYPE_CHECKING:
+    from ui.playlist_preview import PlaylistPreviewPanel
+    from ui.history_page import HistoryPage
 
 
 class App(ctk.CTk):
@@ -31,8 +36,6 @@ class App(ctk.CTk):
     STATUS_MIN_HEIGHT = 160
     STATUS_MAX_HEIGHT = 260
     PLAYLIST_AUTO_FETCH_DELAY_MS = 250
-    # Coalesce live-resize events so we only redraw after the user stops dragging.
-    RESIZE_REDRAW_DELAY_MS = 80
     def __init__(self) -> None:
         super().__init__()
 
@@ -55,17 +58,16 @@ class App(ctk.CTk):
         self._expected_formats_request_id: Optional[int] = None
         self._expected_formats_index: Optional[int] = None
         self._warning_once: set[str] = set()
-        self._content_scroll_job: Optional[str] = None
-        self._content_last_height: Optional[int] = None
-        self._content_width_job: Optional[str] = None
-        self._content_last_width: Optional[int] = None
-        self._pending_content_width: Optional[int] = None
-        self._pending_scrollregion = False
-        self._resize_redraw_job: Optional[str] = None
-        self._resize_redraw_disabled = False
-        self._resize_in_progress = False
-        self._last_window_state: Optional[str] = None
         self._wheel_remainders: Dict[object, float] = {}
+        self._main_scroll_canvas: Optional[tk.Canvas] = None
+        self._pending_history: Optional[dict] = None
+        self._history_store: Optional[HistoryStore] = None
+        self._history_loaded = False
+        self._history_page_built = False
+        self._closing = False
+        self._build_job: Optional[str] = None
+        self._build_queue_job: Optional[str] = None
+        self._build_queue: List[Callable[[], None]] = []
 
         self.url_var = ctk.StringVar()
         self.playlist_url_var = ctk.StringVar()
@@ -84,17 +86,25 @@ class App(ctk.CTk):
         self._preview_loaded = 0
         self._preview_total: Optional[int] = None
         self._preview_loading = False
+        self.preview_panel: Optional["PlaylistPreviewPanel"] = None
 
         self._log_file = self._init_log_file()
-        self._build_ui()
-        self._poll_events()
-        self._check_yt_dlp()
+        self._download_ui_built = False
+        self._schedule_build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.format_type_var.trace_add("write", self._on_selection_change)
         self.resolution_var.trace_add("write", self._on_selection_change)
 
+    def _schedule_build_ui(self) -> None:
+        if self._build_job:
+            self.after_cancel(self._build_job)
+        self._build_job = self.after(0, self._build_ui)
+
     def _build_ui(self) -> None:
+        self._build_job = None
+        if self._closing or not self.winfo_exists():
+            return
         header = Header(self)
         header.pack(fill="x", padx=20, pady=(20, 10))
         self._sync_root_bg(header.cget("fg_color"))
@@ -120,42 +130,37 @@ class App(ctk.CTk):
         self._download_page.grid_rowconfigure(0, weight=1)
         self._download_page.grid_columnconfigure(0, weight=1)
 
-        self._history_page = ctk.CTkFrame(self._pages_container, corner_radius=0, fg_color="transparent")
-        self._history_page.grid(row=0, column=0, sticky="nsew")
-        self._history_page.grid_rowconfigure(0, weight=1)
-        self._history_page.grid_columnconfigure(0, weight=1)
-
-        history_label = ctk.CTkLabel(
-            self._history_page,
-            text="History (coming soon)",
-            font=ctk.CTkFont("Segoe UI", 16, weight="bold"),
-        )
-        history_label.pack(pady=40)
+        self._history_host = ctk.CTkFrame(self._pages_container, corner_radius=0, fg_color="transparent")
+        self._history_host.grid(row=0, column=0, sticky="nsew")
+        self._history_page: Optional[HistoryPage] = None
 
         self._show_page("download")
 
-        self._content_container = ctk.CTkFrame(self._download_page, corner_radius=0, fg_color="transparent")
-        self._content_container.pack(fill="both", expand=True)
-        self._content_container.grid_rowconfigure(0, weight=1)
-        self._content_container.grid_columnconfigure(0, weight=1)
-
-        self._content_canvas = tk.Canvas(self._content_container, highlightthickness=0, bd=0)
-        self._content_canvas.configure(yscrollincrement=1)
-        self._content_scrollbar = ctk.CTkScrollbar(
-            self._content_container,
-            orientation="vertical",
-            command=self._content_canvas.yview,
+        self._download_placeholder = ctk.CTkLabel(
+            self._download_page,
+            text="Loading…",
+            font=ctk.CTkFont("Segoe UI", 14),
         )
-        self._content_canvas.configure(yscrollcommand=self._content_scrollbar.set)
-        self._content_canvas.grid(row=0, column=0, sticky="nsew")
-        self._content_scrollbar.grid(row=0, column=1, sticky="ns")
-        self._apply_canvas_bg(self._content_canvas, self._body.cget("fg_color"))
+        self._download_placeholder.pack(expand=True, pady=40)
 
-        self._content = ctk.CTkFrame(self._content_canvas, corner_radius=0, fg_color="transparent")
-        self._content_window = self._content_canvas.create_window((0, 0), window=self._content, anchor="nw")
+        self.after_idle(self._build_download_content)
+
+    def _build_download_content(self) -> None:
+        if self._closing or not self.winfo_exists():
+            return
+        if self._download_ui_built:
+            return
+        self._download_ui_built = True
+        if getattr(self, "_download_placeholder", None):
+            try:
+                self._download_placeholder.destroy()
+            except Exception:
+                pass
+
+        self._content = ctk.CTkScrollableFrame(self._download_page, corner_radius=0, fg_color="transparent")
+        self._content.pack(fill="both", expand=True)
         self._content.grid_columnconfigure(0, weight=1)
-        self._content.bind("<Configure>", self._schedule_content_scrollregion)
-        self._content_canvas.bind("<Configure>", self._on_content_canvas_configure)
+        self._main_scroll_canvas = getattr(self._content, "_parent_canvas", None)
 
         self.tabview = ctk.CTkTabview(self._content)
         self.tabview.grid(row=0, column=0, sticky="ew", padx=18, pady=18)
@@ -187,6 +192,28 @@ class App(ctk.CTk):
         )
         self.playlist_form_panel.pack(fill="x", padx=18, pady=(18, 10))
 
+        self._set_controls_state("disabled")
+        self._build_queue = [
+            lambda: self._build_options_panel(),
+            lambda: self._build_info_panel(),
+            lambda: self._build_preview_panel(playlist_tab),
+            lambda: self._build_status_panel(),
+            lambda: self._finish_download_build(),
+        ]
+        self._run_build_queue()
+
+    def _run_build_queue(self) -> None:
+        if self._closing or not self.winfo_exists():
+            return
+        if not self._build_queue:
+            self._build_queue_job = None
+            return
+        step = self._build_queue.pop(0)
+        step()
+        if self._build_queue:
+            self._build_queue_job = self.after_idle(self._run_build_queue)
+
+    def _build_options_panel(self) -> None:
         self.options_panel = OptionsPanel(
             self._content,
             format_type_var=self.format_type_var,
@@ -201,8 +228,14 @@ class App(ctk.CTk):
         )
         self.options_panel.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 18))
 
+    def _build_info_panel(self) -> None:
         self.info_panel = InfoPanel(self._content)
         self.info_panel.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 18))
+
+    def _build_preview_panel(self, playlist_tab: ctk.CTkBaseClass) -> None:
+        if self.preview_panel is not None:
+            return
+        from ui.playlist_preview import PlaylistPreviewPanel
 
         self.preview_panel = PlaylistPreviewPanel(
             playlist_tab,
@@ -219,6 +252,7 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+    def _build_status_panel(self) -> None:
         self.status_panel = StatusPanel(
             self._content,
             min_height=self.STATUS_MIN_HEIGHT,
@@ -226,29 +260,36 @@ class App(ctk.CTk):
         )
         self.status_panel.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 18))
         self._content.grid_rowconfigure(3, weight=1)
-        self._append_log("Ready.")
 
+    def _finish_download_build(self) -> None:
+        self._append_log("Ready.")
         self._progress_targets = [
             (self.form_panel.progress, self.form_panel.progress_label),
             (self.playlist_form_panel.progress, self.playlist_form_panel.progress_label),
         ]
+        self._set_controls_state("normal")
         self._set_playlist_selection_state(False, False)
-        self.bind("<Configure>", self._on_root_configure, add="+")
         self._bind_global_scroll_events()
+        # Keep startup light: avoid extra redraw hooks on window state changes.
+        self._poll_events()
+        self._check_yt_dlp()
 
     def _on_nav_select(self, key: str) -> None:
         self._show_page(key)
 
     def _show_page(self, key: str) -> None:
         if key == "history":
-            self._history_page.tkraise()
+            self._ensure_history_page()
+            self._history_host.tkraise()
+            if not self._history_loaded:
+                self.after_idle(self._refresh_history)
         else:
             self._download_page.tkraise()
             key = "download"
         self.sidebar.set_active(key)
 
     def _bind_global_scroll_events(self) -> None:
-        def on_mousewheel(event: object) -> None:
+        def on_mousewheel(event: object) -> str:
             delta = 0.0
             wheel_delta = int(getattr(event, "delta", 0))
             if wheel_delta:
@@ -258,20 +299,23 @@ class App(ctk.CTk):
             elif getattr(event, "num", None) == 5:
                 delta = float(self.SCROLL_SPEED)
             if not delta:
-                return
+                return ""
             widget = self.winfo_containing(event.x_root, event.y_root)
             canvas = self._resolve_scroll_canvas(widget)
             if canvas is None:
-                return
+                return ""
             remainder = self._wheel_remainders.get(canvas, 0.0) + delta
             step = int(remainder)
             if step != 0:
                 try:
                     canvas.yview_scroll(step, "units")
                 except Exception:
-                    return
+                    return ""
                 remainder -= step
             self._wheel_remainders[canvas] = remainder
+            if self.preview_panel and canvas == self.preview_panel.get_scroll_canvas():
+                self.preview_panel.on_canvas_scroll()
+            return "break"
 
         self.bind_all("<MouseWheel>", on_mousewheel)
         self.bind_all("<Button-4>", on_mousewheel)
@@ -282,7 +326,11 @@ class App(ctk.CTk):
             preview_frame = self.preview_panel.get_scroll_frame()
             if self._is_descendant(widget, preview_frame):
                 return self.preview_panel.get_scroll_canvas()
-        return self._content_canvas
+        if widget and self._history_page:
+            history_frame = self._history_page.get_scroll_frame()
+            if self._is_descendant(widget, history_frame):
+                return self._history_page.get_scroll_canvas()
+        return self._main_scroll_canvas
 
     @staticmethod
     def _is_descendant(widget: ctk.CTkBaseClass, ancestor: ctk.CTkBaseClass) -> bool:
@@ -299,68 +347,7 @@ class App(ctk.CTk):
                 return False
         return False
 
-    def _schedule_content_scrollregion(self, _event: object | None = None) -> None:
-        # While actively resizing the window on Windows, coalesce expensive scrollregion
-        # recalcs to the end of the drag to reduce UI lag/jitter.
-        if sys.platform.startswith("win") and self._resize_in_progress:
-            self._pending_scrollregion = True
-            return
-        if self._content_scroll_job:
-            self.after_cancel(self._content_scroll_job)
-        self._content_scroll_job = self.after_idle(self._update_content_scrollregion)
 
-    def _update_content_scrollregion(self) -> None:
-        self._content_scroll_job = None
-        if not self._content_canvas.winfo_exists():
-            return
-        height = self._content.winfo_reqheight()
-        if self._content_last_height == height:
-            return
-        self._content_last_height = height
-        try:
-            self._content_canvas.configure(scrollregion=self._content_canvas.bbox("all"))
-        except Exception:
-            pass
-
-    def _on_content_canvas_configure(self, _event: object) -> None:
-        # Canvas width updates can fire extremely frequently during live resize.
-        # Coalesce these to avoid hammering geometry/layout.
-        try:
-            width = self._content_canvas.winfo_width()
-            if sys.platform.startswith("win") and self._resize_in_progress:
-                self._pending_content_width = width
-                return
-            self._schedule_content_width_update(width)
-        except Exception:
-            pass
-
-    def _schedule_content_width_update(self, width: int) -> None:
-        if self._content_width_job:
-            self.after_cancel(self._content_width_job)
-        self._pending_content_width = width
-        self._content_width_job = self.after_idle(self._apply_content_width_update)
-
-    def _apply_content_width_update(self) -> None:
-        self._content_width_job = None
-        if self._pending_content_width is None:
-            return
-        width = self._pending_content_width
-        self._pending_content_width = None
-        if self._content_last_width == width:
-            return
-        self._content_last_width = width
-        try:
-            self._content_canvas.itemconfigure(self._content_window, width=width)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _apply_canvas_bg(canvas: tk.Canvas, color: object) -> None:
-        color_value = App._resolve_color(color)
-        try:
-            canvas.configure(bg=color_value)
-        except Exception:
-            pass
 
     @staticmethod
     def _resolve_color(color: object) -> object:
@@ -376,82 +363,6 @@ class App(ctk.CTk):
             pass
         try:
             self.configure(bg=self._resolve_color(color))
-        except Exception:
-            pass
-
-    def _on_root_configure(self, event: tk.Event) -> None:
-        if not sys.platform.startswith("win"):
-            return
-        
-        if getattr(event, 'widget', None) is not self:
-            return
-
-        # Avoid freezing redraw around true state transitions (maximize/restore/minimize).
-        # Pixel-jump heuristics can misfire during fast horizontal drags.
-        try:
-            state = self.state()
-        except Exception:
-            state = None
-        if state is not None and state != self._last_window_state:
-            self._last_window_state = state
-            return
-        
-        if not self._resize_redraw_disabled:
-            self._set_window_redraw(False)
-            self._resize_redraw_disabled = True
-            self._resize_in_progress = True
-            # Cancel pending expensive layout jobs; we'll apply once at resize end.
-            if self._content_scroll_job:
-                try:
-                    self.after_cancel(self._content_scroll_job)
-                except Exception:
-                    pass
-                self._content_scroll_job = None
-            if self._content_width_job:
-                try:
-                    self.after_cancel(self._content_width_job)
-                except Exception:
-                    pass
-                self._content_width_job = None
-        
-        if self._resize_redraw_job:
-            self.after_cancel(self._resize_redraw_job)
-        self._resize_redraw_job = self.after(self.RESIZE_REDRAW_DELAY_MS, self._resume_window_redraw)
-
-    def _resume_window_redraw(self) -> None:
-        self._resize_redraw_job = None
-        if self._resize_redraw_disabled:
-            self._set_window_redraw(True)
-            self._resize_redraw_disabled = False
-            self._resize_in_progress = False
-
-            # Apply any deferred layout updates triggered during live resize.
-            if self._pending_content_width is not None:
-                self._schedule_content_width_update(self._pending_content_width)
-            if self._pending_scrollregion:
-                self._pending_scrollregion = False
-                self._schedule_content_scrollregion()
-
-            # Let Tk flush geometry updates; avoid forcing a full event loop turn here.
-            try:
-                self.update_idletasks()
-            except Exception:
-                pass
-
-    def _set_window_redraw(self, enabled: bool) -> None:
-        try:
-            hwnd = int(self.winfo_id())
-        except Exception:
-            return
-        try:
-            user32 = ctypes.windll.user32
-            WM_SETREDRAW = 0x000B
-            RDW_INVALIDATE = 0x0001
-            RDW_UPDATENOW = 0x0100
-            RDW_ALLCHILDREN = 0x0080
-            user32.SendMessageW(hwnd, WM_SETREDRAW, 1 if enabled else 0, 0)
-            if enabled:
-                user32.RedrawWindow(hwnd, 0, 0, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN)
         except Exception:
             pass
 
@@ -533,6 +444,12 @@ class App(ctk.CTk):
             messagebox.showwarning("Missing output", "Please choose an output folder.")
             return
 
+        self._prepare_history_context(
+            url=url,
+            title=self._current_info.get("title") if self._current_info else None,
+            output_dir=output_dir,
+            mode="single",
+        )
         self._set_busy(True, task="download")
         self._controller.start_download(
             url=url,
@@ -620,6 +537,12 @@ class App(ctk.CTk):
             return
 
         items_arg = self._get_selected_playlist_items_arg()
+        self._prepare_history_context(
+            url=url,
+            title=self._resolve_playlist_history_title(),
+            output_dir=output_dir,
+            mode="playlist_selection",
+        )
         self._set_busy(True, task="download_item")
         self._controller.start_download(
             url=url,
@@ -645,6 +568,12 @@ class App(ctk.CTk):
             messagebox.showwarning("Missing output", "Please choose an output folder.")
             return
 
+        self._prepare_history_context(
+            url=url,
+            title=self._resolve_playlist_history_title(full_playlist=True),
+            output_dir=output_dir,
+            mode="playlist",
+        )
         self._set_busy(True, task="download_playlist")
         self._controller.start_download(
             url=url,
@@ -663,6 +592,30 @@ class App(ctk.CTk):
         if self._current_task not in ("download", "download_item", "download_playlist"):
             return
         self._controller.cancel_download()
+
+    def _prepare_history_context(
+        self,
+        *,
+        url: str,
+        title: Optional[str],
+        output_dir: str,
+        mode: str,
+    ) -> None:
+        resolved_title = (title or "").strip() or url
+        self._pending_history = {
+            "url": url,
+            "title": resolved_title,
+            "output_dir": output_dir,
+            "mode": mode,
+        }
+
+    def _resolve_playlist_history_title(self, full_playlist: bool = False) -> str:
+        if full_playlist:
+            return "Playlist download"
+        if len(self._selected_playlist_items) == 1:
+            return self._selected_playlist_items[0].title
+        count = len(self._selected_playlist_items)
+        return f"{count} playlist items"
 
     def _on_diagnostics(self) -> None:
         self._append_log("Running diagnostics...")
@@ -983,6 +936,13 @@ class App(ctk.CTk):
             while processed < 50:
                 event, payload = self._event_queue.get_nowait()
                 processed +=1
+                if event == "download_complete":
+                    output_paths = payload if isinstance(payload, list) else []
+                    self._record_history("completed", output_paths=output_paths)
+                elif event == "download_cancelled":
+                    self._record_history("cancelled")
+                elif event == "download_error":
+                    self._record_history("failed", error=str(payload))
                 if event == "formats":
                     request_id: Optional[int] = None
                     options = payload
@@ -1057,6 +1017,84 @@ class App(ctk.CTk):
         delay = 20 if self._current_task else 100
         self.after(delay, self._poll_events)
 
+    def _record_history(
+        self,
+        status: str,
+        *,
+        output_paths: Optional[List[str]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        if not self._pending_history:
+            return
+        self._ensure_history_store()
+        entry = HistoryEntry.create(
+            status=status,
+            title=self._pending_history.get("title", ""),
+            url=self._pending_history.get("url", ""),
+            output_dir=self._pending_history.get("output_dir", ""),
+            output_paths=output_paths,
+            error=error,
+        )
+        if self._history_store:
+            self._history_store.append(entry)
+        self._pending_history = None
+        self._refresh_history()
+
+    def _refresh_history(self) -> None:
+        self._ensure_history_store()
+        if not self._history_store or not self._history_page:
+            return
+        entries = self._history_store.load()
+        self._history_page.set_items(entries)
+        self._history_loaded = True
+
+    def _on_clear_history(self) -> None:
+        self._ensure_history_store()
+        if self._history_store:
+            self._history_store.clear()
+        self._refresh_history()
+
+    def _on_open_history_folder(self, entry: HistoryEntry) -> None:
+        if entry.output_dir:
+            self._open_path(entry.output_dir)
+
+    def _on_retry_history(self, entry: HistoryEntry) -> None:
+        if not entry.url:
+            return
+        self._show_page("download")
+        self.url_var.set(entry.url)
+        self._on_download_single()
+
+    def _ensure_history_store(self) -> None:
+        if self._history_store is None:
+            self._history_store = HistoryStore()
+
+    def _ensure_history_page(self) -> None:
+        if self._history_page_built:
+            return
+        from ui.history_page import HistoryPage
+
+        self._history_page = HistoryPage(
+            self._history_host,
+            on_clear=self._on_clear_history,
+            on_open_folder=self._on_open_history_folder,
+            on_retry=self._on_retry_history,
+        )
+        self._history_page.pack(fill="both", expand=True)
+        self._history_page_built = True
+
+    @staticmethod
+    def _open_path(path: str) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path], check=False)
+            else:
+                subprocess.run(["xdg-open", path], check=False)
+        except Exception:
+            return
+
     def _init_log_file(self) -> Optional[object]:
         try:
             logs_dir = Path(__file__).resolve().parent / "logs"
@@ -1068,6 +1106,19 @@ class App(ctk.CTk):
             return None
 
     def _on_close(self) -> None:
+        self._closing = True
+        if self._build_job:
+            try:
+                self.after_cancel(self._build_job)
+            except Exception:
+                pass
+            self._build_job = None
+        if self._build_queue_job:
+            try:
+                self.after_cancel(self._build_queue_job)
+            except Exception:
+                pass
+            self._build_queue_job = None
         if self._log_file:
             try:
                 self._log_file.close()

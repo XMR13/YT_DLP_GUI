@@ -37,6 +37,8 @@ class PlaylistItem:
 
 
 class YtDlpAdapter:
+    FILE_PRINT_PREFIX = "__FILE__:"
+
     def __init__(
         self,
         logger: Optional[Logger] = None,
@@ -218,7 +220,7 @@ class YtDlpAdapter:
         js_runtime: Optional[str] = None,
         js_runtime_path: Optional[str] = None,
         remote_components: Optional[str] = None,
-    ) -> None:
+    ) -> List[str]:
         self._cancel_requested = False
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         if audio_only:
@@ -235,6 +237,10 @@ class YtDlpAdapter:
             format_selector,
             "-o",
             output_template,
+            "--newline",
+            "--progress",
+            "--print",
+            f"after_move:{self.FILE_PRINT_PREFIX}%(filepath)s",
             url,
         ]
 
@@ -250,7 +256,9 @@ class YtDlpAdapter:
         self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
 
         self._log("Starting download...")
-        self._run_download_with_retry(args)
+        output_paths: List[str] = []
+        self._run_download_with_retry(args, output_paths)
+        return output_paths
 
     def cancel(self, output_dir: Optional[str], delete_partials: bool = True) -> None:
         self._cancel_requested = True
@@ -265,7 +273,7 @@ class YtDlpAdapter:
                 self._delete_partials(output_dir)
             self._log("Download cancelled.")
 
-    def _run_download_with_retry(self, args: List[str]) -> None:
+    def _run_download_with_retry(self, args: List[str], output_paths: List[str]) -> None:
         had_forbidden = False
         had_sabr_warning = False
         if self._cancel_requested:
@@ -284,6 +292,11 @@ class YtDlpAdapter:
                     raise DownloadCancelled()
                 line = line.strip()
                 if not line:
+                    continue
+                if line.startswith(self.FILE_PRINT_PREFIX):
+                    path = line.removeprefix(self.FILE_PRINT_PREFIX).strip()
+                    if path:
+                        output_paths.append(path)
                     continue
                 if "HTTP Error 403" in line or "403: Forbidden" in line:
                     had_forbidden = True
@@ -320,9 +333,15 @@ class YtDlpAdapter:
                     if self._cancel_requested:
                         raise DownloadCancelled()
                     line = line.strip()
-                    if line:
-                        self._log(line)
-                        self._update_progress_from_line(line)
+                    if not line:
+                        continue
+                    if line.startswith(self.FILE_PRINT_PREFIX):
+                        path = line.removeprefix(self.FILE_PRINT_PREFIX).strip()
+                        if path:
+                            output_paths.append(path)
+                        continue
+                    self._log(line)
+                    self._update_progress_from_line(line)
                 process.wait()
                 if self._cancel_requested:
                     raise DownloadCancelled()
