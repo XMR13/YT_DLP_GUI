@@ -37,19 +37,31 @@ class InfoPanel(ctk.CTkFrame):
         self.columnconfigure(0, weight=0)
         self.columnconfigure(1, weight=1)
 
+        self._wrap_job: str | None = None
+        self._last_wraplength: int | None = None
         self.bind("<Configure>", self._on_configure)
         self.after(0, self._update_title_wraplength)
 
     def _update_title_wraplength(self) -> None:
+        self._wrap_job = None
         title_label = self.values.get("title")
         if not title_label:
             return
         width = self.winfo_width()
         wraplength = max(200, width - 280)
+        if self._last_wraplength == wraplength:
+            return
+        self._last_wraplength = wraplength
         title_label.configure(wraplength=wraplength)
 
     def _on_configure(self, _event: object) -> None:
-        self._update_title_wraplength()
+        # Coalesce rapid configure events during window resize.
+        if self._wrap_job is not None:
+            try:
+                self.after_cancel(self._wrap_job)
+            except Exception:
+                pass
+        self._wrap_job = self.after_idle(self._update_title_wraplength)
 
     def update_values(self, values: Dict[str, str]) -> None:
         for key, widget in self.values.items():

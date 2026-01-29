@@ -22,6 +22,7 @@ from ui.options_panel import OptionsPanel
 from ui.playlist_form_panel import PlaylistFormPanel
 from ui.playlist_preview import PlaylistPreviewPanel
 from ui.status_panel import StatusPanel
+from ui.sidebar import SidebarNav
 from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
 
 
@@ -30,7 +31,8 @@ class App(ctk.CTk):
     STATUS_MIN_HEIGHT = 160
     STATUS_MAX_HEIGHT = 260
     PLAYLIST_AUTO_FETCH_DELAY_MS = 250
-    RESIZE_REDRAW_DELAY_MS = 40
+    # Coalesce live-resize events so we only redraw after the user stops dragging.
+    RESIZE_REDRAW_DELAY_MS = 80
     def __init__(self) -> None:
         super().__init__()
 
@@ -55,8 +57,14 @@ class App(ctk.CTk):
         self._warning_once: set[str] = set()
         self._content_scroll_job: Optional[str] = None
         self._content_last_height: Optional[int] = None
+        self._content_width_job: Optional[str] = None
+        self._content_last_width: Optional[int] = None
+        self._pending_content_width: Optional[int] = None
+        self._pending_scrollregion = False
         self._resize_redraw_job: Optional[str] = None
         self._resize_redraw_disabled = False
+        self._resize_in_progress = False
+        self._last_window_state: Optional[str] = None
         self._wheel_remainders: Dict[object, float] = {}
 
         self.url_var = ctk.StringVar()
@@ -94,7 +102,39 @@ class App(ctk.CTk):
         self._body = ctk.CTkFrame(self, corner_radius=18)
         self._body.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        self._content_container = ctk.CTkFrame(self._body, corner_radius=0, fg_color="transparent")
+        self._main = ctk.CTkFrame(self._body, corner_radius=0, fg_color="transparent")
+        self._main.pack(fill="both", expand=True)
+        self._main.grid_rowconfigure(0, weight=1)
+        self._main.grid_columnconfigure(1, weight=1)
+
+        self.sidebar = SidebarNav(self._main, on_select=self._on_nav_select)
+        self.sidebar.grid(row=0, column=0, sticky="nsw", padx=(12, 0), pady=12)
+
+        self._pages_container = ctk.CTkFrame(self._main, corner_radius=0, fg_color="transparent")
+        self._pages_container.grid(row=0, column=1, sticky="nsew", padx=12, pady=12)
+        self._pages_container.grid_rowconfigure(0, weight=1)
+        self._pages_container.grid_columnconfigure(0, weight=1)
+
+        self._download_page = ctk.CTkFrame(self._pages_container, corner_radius=0, fg_color="transparent")
+        self._download_page.grid(row=0, column=0, sticky="nsew")
+        self._download_page.grid_rowconfigure(0, weight=1)
+        self._download_page.grid_columnconfigure(0, weight=1)
+
+        self._history_page = ctk.CTkFrame(self._pages_container, corner_radius=0, fg_color="transparent")
+        self._history_page.grid(row=0, column=0, sticky="nsew")
+        self._history_page.grid_rowconfigure(0, weight=1)
+        self._history_page.grid_columnconfigure(0, weight=1)
+
+        history_label = ctk.CTkLabel(
+            self._history_page,
+            text="History (coming soon)",
+            font=ctk.CTkFont("Segoe UI", 16, weight="bold"),
+        )
+        history_label.pack(pady=40)
+
+        self._show_page("download")
+
+        self._content_container = ctk.CTkFrame(self._download_page, corner_radius=0, fg_color="transparent")
         self._content_container.pack(fill="both", expand=True)
         self._content_container.grid_rowconfigure(0, weight=1)
         self._content_container.grid_columnconfigure(0, weight=1)
@@ -196,8 +236,16 @@ class App(ctk.CTk):
         self.bind("<Configure>", self._on_root_configure, add="+")
         self._bind_global_scroll_events()
 
-        self._last_width = 0
-        self._last_height = 0
+    def _on_nav_select(self, key: str) -> None:
+        self._show_page(key)
+
+    def _show_page(self, key: str) -> None:
+        if key == "history":
+            self._history_page.tkraise()
+        else:
+            self._download_page.tkraise()
+            key = "download"
+        self.sidebar.set_active(key)
 
     def _bind_global_scroll_events(self) -> None:
         def on_mousewheel(event: object) -> None:
@@ -252,6 +300,11 @@ class App(ctk.CTk):
         return False
 
     def _schedule_content_scrollregion(self, _event: object | None = None) -> None:
+        # While actively resizing the window on Windows, coalesce expensive scrollregion
+        # recalcs to the end of the drag to reduce UI lag/jitter.
+        if sys.platform.startswith("win") and self._resize_in_progress:
+            self._pending_scrollregion = True
+            return
         if self._content_scroll_job:
             self.after_cancel(self._content_scroll_job)
         self._content_scroll_job = self.after_idle(self._update_content_scrollregion)
@@ -270,8 +323,33 @@ class App(ctk.CTk):
             pass
 
     def _on_content_canvas_configure(self, _event: object) -> None:
+        # Canvas width updates can fire extremely frequently during live resize.
+        # Coalesce these to avoid hammering geometry/layout.
         try:
             width = self._content_canvas.winfo_width()
+            if sys.platform.startswith("win") and self._resize_in_progress:
+                self._pending_content_width = width
+                return
+            self._schedule_content_width_update(width)
+        except Exception:
+            pass
+
+    def _schedule_content_width_update(self, width: int) -> None:
+        if self._content_width_job:
+            self.after_cancel(self._content_width_job)
+        self._pending_content_width = width
+        self._content_width_job = self.after_idle(self._apply_content_width_update)
+
+    def _apply_content_width_update(self) -> None:
+        self._content_width_job = None
+        if self._pending_content_width is None:
+            return
+        width = self._pending_content_width
+        self._pending_content_width = None
+        if self._content_last_width == width:
+            return
+        self._content_last_width = width
+        try:
             self._content_canvas.itemconfigure(self._content_window, width=width)
         except Exception:
             pass
@@ -307,21 +385,34 @@ class App(ctk.CTk):
         
         if getattr(event, 'widget', None) is not self:
             return
-        
-        # Detect maximize/restore: if size jumps by >200px, it's not a drag
-        if hasattr(event, 'width') and hasattr(event, 'height'):
-            width_jump = abs(event.width - self._last_width)
-            height_jump = abs(event.height - self._last_height)
-            self._last_width = event.width
-            self._last_height = event.height
-            
-            # If jumping >200px (maximize/restore), don't block redraw
-            if width_jump > 200 or height_jump > 200:
-                return
+
+        # Avoid freezing redraw around true state transitions (maximize/restore/minimize).
+        # Pixel-jump heuristics can misfire during fast horizontal drags.
+        try:
+            state = self.state()
+        except Exception:
+            state = None
+        if state is not None and state != self._last_window_state:
+            self._last_window_state = state
+            return
         
         if not self._resize_redraw_disabled:
             self._set_window_redraw(False)
             self._resize_redraw_disabled = True
+            self._resize_in_progress = True
+            # Cancel pending expensive layout jobs; we'll apply once at resize end.
+            if self._content_scroll_job:
+                try:
+                    self.after_cancel(self._content_scroll_job)
+                except Exception:
+                    pass
+                self._content_scroll_job = None
+            if self._content_width_job:
+                try:
+                    self.after_cancel(self._content_width_job)
+                except Exception:
+                    pass
+                self._content_width_job = None
         
         if self._resize_redraw_job:
             self.after_cancel(self._resize_redraw_job)
@@ -332,14 +423,19 @@ class App(ctk.CTk):
         if self._resize_redraw_disabled:
             self._set_window_redraw(True)
             self._resize_redraw_disabled = False
+            self._resize_in_progress = False
 
-            self.update_idletasks()
-            self.update()   
-            #invalidate black areas:
+            # Apply any deferred layout updates triggered during live resize.
+            if self._pending_content_width is not None:
+                self._schedule_content_width_update(self._pending_content_width)
+            if self._pending_scrollregion:
+                self._pending_scrollregion = False
+                self._schedule_content_scrollregion()
+
+            # Let Tk flush geometry updates; avoid forcing a full event loop turn here.
             try:
-                hwnd = ctypes.windll.user32.GetWindowDC(int(self.winfo_id()))
-                ctypes.windll.user32.ReleaseDC(int(self.winfo_id()), hwnd)
-            except:
+                self.update_idletasks()
+            except Exception:
                 pass
 
     def _set_window_redraw(self, enabled: bool) -> None:
