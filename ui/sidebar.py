@@ -34,6 +34,7 @@ class SidebarNav(ctk.CTkFrame):
         title.pack(anchor="w", padx=16, pady=(16, 8))
 
         self._add_button("download", "Download", self._icons["download"])
+        self._add_button("queue", "Queue", self._icons["queue"])
         self._add_button("history", "History", self._icons["history"])
 
         spacer = ctk.CTkFrame(self, fg_color="transparent")
@@ -79,6 +80,7 @@ class SidebarNav(ctk.CTkFrame):
     def _build_icons(self) -> Dict[str, ctk.CTkImage]:
         return {
             "download": self._make_icon(self._draw_download_icon),
+            "queue": self._make_icon(self._draw_queue_icon),
             "history": self._make_icon(self._draw_history_icon),
         }
 
@@ -108,4 +110,21 @@ class SidebarNav(ctk.CTkFrame):
         center = size // 2
         draw.line((center, center, center, center - 4), fill=color, width=2)
         draw.line((center, center, center + 4, center + 2), fill=color, width=2)
+        return img
+
+    @staticmethod
+    def _draw_queue_icon(color: str, size: int) -> Image.Image:
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        margin = 3
+        line_height = 2
+        gap = 3
+        for idx in range(3):
+            y = margin + idx * (line_height + gap)
+            draw.rounded_rectangle(
+                (margin, y, size - margin, y + line_height + 2),
+                radius=2,
+                outline=color,
+                width=2,
+            )
         return img

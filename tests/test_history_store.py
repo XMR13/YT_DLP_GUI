@@ -5,6 +5,7 @@ from controllers.history_store import HistoryEntry, HistoryStore
 
 def test_history_store_append_and_clear(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
     store = HistoryStore(app_name="yt-dlp-gui-test", max_entries=5)
 
     entry = HistoryEntry.create(
@@ -26,6 +27,7 @@ def test_history_store_append_and_clear(tmp_path, monkeypatch) -> None:
 
 def test_history_store_truncates(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
     store = HistoryStore(app_name="yt-dlp-gui-test", max_entries=2)
 
     for idx in range(3):

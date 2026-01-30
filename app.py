@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, urlparse
 
 from controllers.download_controller import DownloadController
 from controllers.history_store import HistoryEntry, HistoryStore
+from controllers.queue_runner import QueueRunner, YtDlpExecutor
+from controllers.queue_store import QueueItem, QueueStore
 from ui.form_panel import FormPanel
 from ui.header import Header
 from ui.info_panel import InfoPanel
@@ -29,6 +31,7 @@ from yt_dlp_adapter import FormatOption, PlaylistItem, YtDlpAdapter
 if TYPE_CHECKING:
     from ui.playlist_preview import PlaylistPreviewPanel
     from ui.history_page import HistoryPage
+    from ui.queue_page import QueuePage
 
 
 class App(ctk.CTk):
@@ -49,6 +52,12 @@ class App(ctk.CTk):
         self._event_queue: Queue[Tuple[str, object]] = Queue()
         self._adapter = YtDlpAdapter(self._enqueue_log, self._enqueue_progress)
         self._controller = DownloadController(self._event_queue, self._adapter)
+        self._queue_store = QueueStore()
+        self._queue_runner = QueueRunner(
+            self._queue_store,
+            YtDlpExecutor(self._adapter),
+            self._event_queue,
+        )
         self._format_options: List[FormatOption] = []
         self._format_map: Dict[str, FormatOption] = {}
         self._current_info: Dict = {}
@@ -64,6 +73,8 @@ class App(ctk.CTk):
         self._history_store: Optional[HistoryStore] = None
         self._history_loaded = False
         self._history_page_built = False
+        self._queue_page_built = False
+        self._queue_items: List[dict] = []
         self._closing = False
         self._build_job: Optional[str] = None
         self._build_queue_job: Optional[str] = None
@@ -95,6 +106,7 @@ class App(ctk.CTk):
 
         self.format_type_var.trace_add("write", self._on_selection_change)
         self.resolution_var.trace_add("write", self._on_selection_change)
+        self._queue_runner.load()
 
     def _schedule_build_ui(self) -> None:
         if self._build_job:
@@ -133,6 +145,10 @@ class App(ctk.CTk):
         self._history_host = ctk.CTkFrame(self._pages_container, corner_radius=0, fg_color="transparent")
         self._history_host.grid(row=0, column=0, sticky="nsew")
         self._history_page: Optional[HistoryPage] = None
+
+        self._queue_host = ctk.CTkFrame(self._pages_container, corner_radius=0, fg_color="transparent")
+        self._queue_host.grid(row=0, column=0, sticky="nsew")
+        self._queue_page: Optional[QueuePage] = None
 
         self._show_page("download")
 
@@ -283,6 +299,10 @@ class App(ctk.CTk):
             self._history_host.tkraise()
             if not self._history_loaded:
                 self.after_idle(self._refresh_history)
+        elif key == "queue":
+            self._ensure_queue_page()
+            self._queue_host.tkraise()
+            self.after_idle(self._refresh_queue)
         else:
             self._download_page.tkraise()
             key = "download"
@@ -330,6 +350,10 @@ class App(ctk.CTk):
             history_frame = self._history_page.get_scroll_frame()
             if self._is_descendant(widget, history_frame):
                 return self._history_page.get_scroll_canvas()
+        if widget and self._queue_page:
+            queue_frame = self._queue_page.get_scroll_frame()
+            if self._is_descendant(widget, queue_frame):
+                return self._queue_page.get_scroll_canvas()
         return self._main_scroll_canvas
 
     @staticmethod
@@ -444,14 +468,7 @@ class App(ctk.CTk):
             messagebox.showwarning("Missing output", "Please choose an output folder.")
             return
 
-        self._prepare_history_context(
-            url=url,
-            title=self._current_info.get("title") if self._current_info else None,
-            output_dir=output_dir,
-            mode="single",
-        )
-        self._set_busy(True, task="download")
-        self._controller.start_download(
+        item = QueueItem.create(
             url=url,
             output_dir=output_dir,
             format_id=self._resolve_format_id(),
@@ -462,7 +479,9 @@ class App(ctk.CTk):
             js_runtime=self._normalize_js_runtime(),
             js_runtime_path=self._normalize_runtime_path(),
             remote_components=self._normalize_remote_components(),
+            title=self._current_info.get("title") if self._current_info else None,
         )
+        self._enqueue_queue_items([item])
 
     def _on_fetch_playlist(self) -> None:
         url = self.playlist_url_var.get().strip()
@@ -536,26 +555,26 @@ class App(ctk.CTk):
             messagebox.showwarning("Missing output", "Please choose an output folder.")
             return
 
-        items_arg = self._get_selected_playlist_items_arg()
-        self._prepare_history_context(
-            url=url,
-            title=self._resolve_playlist_history_title(),
-            output_dir=output_dir,
-            mode="playlist_selection",
-        )
-        self._set_busy(True, task="download_item")
-        self._controller.start_download(
-            url=url,
-            output_dir=output_dir,
-            format_id=self._resolve_format_id(),
-            audio_only=self.format_type_var.get() == "Audio only",
-            playlist_mode=True,
-            playlist_items=items_arg,
-            cookies=self._normalize_cookies(),
-            js_runtime=self._normalize_js_runtime(),
-            js_runtime_path=self._normalize_runtime_path(),
-            remote_components=self._normalize_remote_components(),
-        )
+        selections = {item.index: item for item in self._selected_playlist_items}
+        ordered = [selections[idx] for idx in sorted(selections)]
+        items: List[QueueItem] = []
+        for selection in ordered:
+            items.append(
+                QueueItem.create(
+                    url=url,
+                    output_dir=output_dir,
+                    format_id=self._resolve_format_id(),
+                    audio_only=self.format_type_var.get() == "Audio only",
+                    playlist_mode=True,
+                    playlist_items=str(selection.index),
+                    cookies=self._normalize_cookies(),
+                    js_runtime=self._normalize_js_runtime(),
+                    js_runtime_path=self._normalize_runtime_path(),
+                    remote_components=self._normalize_remote_components(),
+                    title=selection.title,
+                )
+            )
+        self._enqueue_queue_items(items)
 
     def _on_download_playlist(self) -> None:
         url = self.playlist_url_var.get().strip()
@@ -568,14 +587,7 @@ class App(ctk.CTk):
             messagebox.showwarning("Missing output", "Please choose an output folder.")
             return
 
-        self._prepare_history_context(
-            url=url,
-            title=self._resolve_playlist_history_title(full_playlist=True),
-            output_dir=output_dir,
-            mode="playlist",
-        )
-        self._set_busy(True, task="download_playlist")
-        self._controller.start_download(
+        item = QueueItem.create(
             url=url,
             output_dir=output_dir,
             format_id=self._resolve_format_id(),
@@ -586,12 +598,70 @@ class App(ctk.CTk):
             js_runtime=self._normalize_js_runtime(),
             js_runtime_path=self._normalize_runtime_path(),
             remote_components=self._normalize_remote_components(),
+            title=self._resolve_playlist_history_title(full_playlist=True),
         )
+        self._enqueue_queue_items([item])
 
     def _on_cancel(self) -> None:
         if self._current_task not in ("download", "download_item", "download_playlist"):
             return
-        self._controller.cancel_download()
+        self._queue_runner.cancel_current()
+
+    def _enqueue_queue_items(self, items: List[QueueItem]) -> None:
+        if not items:
+            return
+        before = len(self._queue_store.load())
+        for item in items:
+            self._queue_runner.enqueue(item, dedupe=True)
+        after = len(self._queue_store.load())
+        added = max(0, after - before)
+        if added <= 0:
+            self._append_log("Already queued.")
+        elif added == 1:
+            self._append_log("Queued 1 item.")
+        else:
+            self._append_log(f"Queued {added} items.")
+        self._queue_runner.start()
+
+    def _refresh_queue(self) -> None:
+        if not self._queue_page:
+            return
+        items = self._queue_items or [item.to_dict() for item in self._queue_store.load()]
+        self._queue_page.set_items(items)
+
+    def _on_queue_start(self) -> None:
+        self._queue_runner.start()
+
+    def _on_queue_stop(self) -> None:
+        self._queue_runner.stop_after_current()
+
+    def _on_queue_cancel(self) -> None:
+        self._queue_runner.cancel_current()
+
+    def _on_queue_clear(self) -> None:
+        if any(item.get("status") == "running" for item in self._queue_items):
+            messagebox.showwarning("Queue running", "Stop or cancel the current item before clearing.")
+            return
+        self._queue_runner.clear()
+        self._queue_items = []
+        self._refresh_queue()
+
+    def _on_queue_remove(self, item_id: str) -> None:
+        if not item_id:
+            return
+        for item in self._queue_items:
+            if item.get("id") == item_id and item.get("status") == "running":
+                messagebox.showwarning("Item running", "Stop or cancel the current item first.")
+                return
+        self._queue_runner.remove(item_id)
+        self._queue_items = [item for item in self._queue_items if item.get("id") != item_id]
+        self._refresh_queue()
+
+    def _on_queue_retry(self, item_id: str) -> None:
+        if not item_id:
+            return
+        self._queue_runner.retry(item_id)
+        self._queue_runner.start()
 
     def _prepare_history_context(
         self,
@@ -760,7 +830,8 @@ class App(ctk.CTk):
         self.playlist_form_panel.download_selected_button.configure(state=download_state)
 
     def _set_busy(self, busy: bool, task: Optional[str] = None) -> None:
-        state = "disabled" if busy else "normal"
+        block_ui = bool(busy and task == "fetch")
+        state = "disabled" if block_ui else "normal"
         self.form_panel.fetch_button.configure(state=state)
         self.form_panel.download_button.configure(state=state)
         self.form_panel.diag_button.configure(state=state)
@@ -768,14 +839,14 @@ class App(ctk.CTk):
         self.playlist_form_panel.download_playlist_button.configure(state=state)
         self.playlist_form_panel.diag_button.configure(state=state)
         self._set_playlist_selection_state(
-            not busy and bool(self._selected_playlist_items),
-            not busy and self._selected_playlist_item is not None,
+            not block_ui and bool(self._selected_playlist_items),
+            not block_ui and self._selected_playlist_item is not None,
         )
         self._current_task = task if busy else None
         cancel_state = "normal" if busy and task in ("download", "download_item", "download_playlist") else "disabled"
         self.form_panel.cancel_button.configure(state=cancel_state)
         self.playlist_form_panel.cancel_button.configure(state=cancel_state)
-        if busy:
+        if busy and task == "fetch":
             self._append_log("Working...")
         else:
             self._update_progress(0.0)
@@ -937,12 +1008,24 @@ class App(ctk.CTk):
                 event, payload = self._event_queue.get_nowait()
                 processed +=1
                 if event == "download_complete":
-                    output_paths = payload if isinstance(payload, list) else []
-                    self._record_history("completed", output_paths=output_paths)
+                    if isinstance(payload, dict) and isinstance(payload.get("item"), dict):
+                        item = payload["item"]
+                        output_paths = payload.get("output_paths") if isinstance(payload.get("output_paths"), list) else []
+                        self._record_history_from_queue_item(item, "completed", output_paths=output_paths)
+                    else:
+                        output_paths = payload if isinstance(payload, list) else []
+                        self._record_history("completed", output_paths=output_paths)
                 elif event == "download_cancelled":
-                    self._record_history("cancelled")
+                    if isinstance(payload, dict) and isinstance(payload.get("item"), dict):
+                        self._record_history_from_queue_item(payload["item"], "cancelled")
+                    else:
+                        self._record_history("cancelled")
                 elif event == "download_error":
-                    self._record_history("failed", error=str(payload))
+                    if isinstance(payload, dict) and isinstance(payload.get("item"), dict):
+                        error = payload.get("error")
+                        self._record_history_from_queue_item(payload["item"], "failed", error=str(error) if error else None)
+                    else:
+                        self._record_history("failed", error=str(payload))
                 if event == "formats":
                     request_id: Optional[int] = None
                     options = payload
@@ -998,6 +1081,11 @@ class App(ctk.CTk):
                     self._append_log(str(payload))
                 elif event == "progress":
                     self._update_progress(float(payload))
+                elif event == "queue_updated":
+                    if isinstance(payload, list):
+                        self._queue_items = list(payload)
+                        if self._queue_page:
+                            self._queue_page.set_items(self._queue_items)
                 elif event == "error":
                     self._append_log(f"Error: {payload}")
                     messagebox.showerror("Error", str(payload))
@@ -1038,6 +1126,31 @@ class App(ctk.CTk):
         if self._history_store:
             self._history_store.append(entry)
         self._pending_history = None
+        self._refresh_history()
+
+    def _record_history_from_queue_item(
+        self,
+        item: dict,
+        status: str,
+        *,
+        output_paths: Optional[List[str]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self._ensure_history_store()
+        if not self._history_store:
+            return
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        output_dir = str(item.get("output_dir") or "").strip()
+        entry = HistoryEntry.create(
+            status=status,
+            title=title or url,
+            url=url,
+            output_dir=output_dir,
+            output_paths=output_paths,
+            error=error,
+        )
+        self._history_store.append(entry)
         self._refresh_history()
 
     def _refresh_history(self) -> None:
@@ -1083,6 +1196,23 @@ class App(ctk.CTk):
         self._history_page.pack(fill="both", expand=True)
         self._history_page_built = True
 
+    def _ensure_queue_page(self) -> None:
+        if self._queue_page_built:
+            return
+        from ui.queue_page import QueuePage
+
+        self._queue_page = QueuePage(
+            self._queue_host,
+            on_start=self._on_queue_start,
+            on_stop=self._on_queue_stop,
+            on_cancel=self._on_queue_cancel,
+            on_clear=self._on_queue_clear,
+            on_remove=self._on_queue_remove,
+            on_retry=self._on_queue_retry,
+        )
+        self._queue_page.pack(fill="both", expand=True)
+        self._queue_page_built = True
+
     @staticmethod
     def _open_path(path: str) -> None:
         try:
@@ -1107,6 +1237,10 @@ class App(ctk.CTk):
 
     def _on_close(self) -> None:
         self._closing = True
+        try:
+            self._queue_runner.shutdown()
+        except Exception:
+            pass
         if self._build_job:
             try:
                 self.after_cancel(self._build_job)
