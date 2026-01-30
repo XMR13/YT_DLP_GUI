@@ -276,6 +276,7 @@ class App(ctk.CTk):
         )
         self.status_panel.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 18))
         self._content.grid_rowconfigure(3, weight=1)
+        self._update_queue_summary(self._queue_items)
 
     def _finish_download_build(self) -> None:
         self._append_log("Ready.")
@@ -628,12 +629,15 @@ class App(ctk.CTk):
             return
         items = self._queue_items or [item.to_dict() for item in self._queue_store.load()]
         self._queue_page.set_items(items)
+        self._update_queue_summary(items)
 
     def _on_queue_start(self) -> None:
         self._queue_runner.start()
+        self._update_queue_summary(self._queue_items)
 
     def _on_queue_stop(self) -> None:
         self._queue_runner.stop_after_current()
+        self._update_queue_summary(self._queue_items)
 
     def _on_queue_cancel(self) -> None:
         self._queue_runner.cancel_current()
@@ -662,6 +666,35 @@ class App(ctk.CTk):
             return
         self._queue_runner.retry(item_id)
         self._queue_runner.start()
+        self._update_queue_summary(self._queue_items)
+
+    def _on_queue_clear_completed(self) -> None:
+        self._queue_runner.clear_completed()
+
+    def _update_queue_summary(self, items: List[dict]) -> None:
+        total = len(items)
+        running = sum(1 for item in items if item.get("status") == "running")
+        queued = sum(1 for item in items if item.get("status") == "queued")
+        run_requested = self._queue_runner.is_running_requested()
+        if running and run_requested:
+            state_label = "Running"
+        elif running and not run_requested:
+            state_label = "Stopping"
+        elif run_requested:
+            state_label = "Idle"
+        else:
+            state_label = "Stopped"
+        summary = f"Queue: {total} • {state_label}"
+        if total:
+            summary = f"Queue: {total} • {queued} queued • {running} running • {state_label}"
+            running_item = next((item for item in items if item.get("status") == "running"), None)
+            if running_item:
+                title = str(running_item.get("title") or running_item.get("url") or "").strip()
+                if len(title) > 48:
+                    title = title[:45] + "..."
+                if title:
+                    summary = f"{summary} • {title}"
+        self.status_panel.set_queue_summary(summary)
 
     def _prepare_history_context(
         self,
@@ -1086,6 +1119,7 @@ class App(ctk.CTk):
                         self._queue_items = list(payload)
                         if self._queue_page:
                             self._queue_page.set_items(self._queue_items)
+                        self._update_queue_summary(self._queue_items)
                 elif event == "error":
                     self._append_log(f"Error: {payload}")
                     messagebox.showerror("Error", str(payload))
@@ -1207,6 +1241,7 @@ class App(ctk.CTk):
             on_stop=self._on_queue_stop,
             on_cancel=self._on_queue_cancel,
             on_clear=self._on_queue_clear,
+            on_clear_completed=self._on_queue_clear_completed,
             on_remove=self._on_queue_remove,
             on_retry=self._on_queue_retry,
         )

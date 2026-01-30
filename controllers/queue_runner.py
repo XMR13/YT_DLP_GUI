@@ -74,6 +74,12 @@ class QueueRunner:
         self._emit_queue_updated(items)
         return items
 
+    def clear_completed(self) -> List[QueueItem]:
+        items = [item for item in self._store.load() if item.status != "completed"]
+        self._store.save(items)
+        self._emit_queue_updated(items)
+        return items
+
     def start(self) -> None:
         with self._lock:
             self._run_requested = True
@@ -89,6 +95,10 @@ class QueueRunner:
         with self._lock:
             self._run_requested = False
         self._wake.set()
+
+    def is_running_requested(self) -> bool:
+        with self._lock:
+            return self._run_requested
 
     def cancel_current(self) -> None:
         with self._lock:

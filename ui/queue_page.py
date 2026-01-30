@@ -16,6 +16,7 @@ class QueuePage(ctk.CTkFrame):
         on_stop: Optional[Callable[[], None]] = None,
         on_cancel: Optional[Callable[[], None]] = None,
         on_clear: Optional[Callable[[], None]] = None,
+        on_clear_completed: Optional[Callable[[], None]] = None,
         on_remove: Optional[QueueAction] = None,
         on_retry: Optional[QueueAction] = None,
         **kwargs: object,
@@ -25,6 +26,7 @@ class QueuePage(ctk.CTkFrame):
         self._on_stop = on_stop
         self._on_cancel = on_cancel
         self._on_clear = on_clear
+        self._on_clear_completed = on_clear_completed
         self._on_remove = on_remove
         self._on_retry = on_retry
         self._rows: List[ctk.CTkFrame] = []
@@ -89,6 +91,14 @@ class QueuePage(ctk.CTkFrame):
             command=self._handle_clear,
         )
         self._clear_btn.pack(side="left", padx=4)
+
+        self._clear_done_btn = ctk.CTkButton(
+            controls,
+            text="Clear done",
+            width=90,
+            command=self._handle_clear_completed,
+        )
+        self._clear_done_btn.pack(side="left", padx=4)
 
         self._list = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self._list.pack(fill="both", expand=True)
@@ -229,3 +239,7 @@ class QueuePage(ctk.CTkFrame):
     def _handle_clear(self) -> None:
         if self._on_clear:
             self._on_clear()
+
+    def _handle_clear_completed(self) -> None:
+        if self._on_clear_completed:
+            self._on_clear_completed()

@@ -12,10 +12,19 @@ class StatusPanel(ctk.CTkFrame):
         super().__init__(master, corner_radius=12, **kwargs)
 
         self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=0)
         self.grid_rowconfigure(1, weight=1)
 
         log_label = ctk.CTkLabel(self, text="Status")
         log_label.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
+
+        self.queue_label = ctk.CTkLabel(
+            self,
+            text="Queue: 0",
+            font=ctk.CTkFont("Segoe UI", 11),
+            anchor="e",
+        )
+        self.queue_label.grid(row=0, column=1, sticky="e", padx=12, pady=(12, 4))
 
         self._min_height = min_height
         self._max_height = max_height
@@ -41,3 +50,6 @@ class StatusPanel(ctk.CTkFrame):
         self.log_box.insert("end", message + "\n")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+
+    def set_queue_summary(self, text: str) -> None:
+        self.queue_label.configure(text=text)
