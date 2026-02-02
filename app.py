@@ -64,8 +64,11 @@ class App(ctk.CTk):
         self._current_task: Optional[str] = None
         self._solver_warning_shown = False
         self._auto_fetch_job: Optional[str] = None
+        self._item_info_job: Optional[str] = None
         self._expected_formats_request_id: Optional[int] = None
         self._expected_formats_index: Optional[int] = None
+        self._expected_item_info_request_id: Optional[int] = None
+        self._expected_item_info_index: Optional[int] = None
         self._warning_once: set[str] = set()
         self._wheel_remainders: Dict[object, float] = {}
         self._main_scroll_canvas: Optional[tk.Canvas] = None
@@ -494,6 +497,14 @@ class App(ctk.CTk):
         self._selected_playlist_items = []
         self._playlist_item_info_cache.clear()
         self._playlist_item_formats_cache.clear()
+        self._expected_item_info_request_id = None
+        self._expected_item_info_index = None
+        if self._item_info_job:
+            try:
+                self.after_cancel(self._item_info_job)
+            except Exception:
+                pass
+            self._item_info_job = None
         self._set_playlist_selection_state(False, False)
         self.preview_panel.set_items([])
         self._preview_page_size = 20
@@ -671,6 +682,18 @@ class App(ctk.CTk):
     def _on_queue_clear_completed(self) -> None:
         self._queue_runner.clear_completed()
 
+    def _on_queue_clear_failed(self) -> None:
+        self._queue_items = [item.to_dict() for item in self._queue_runner.clear_failed()]
+        self._refresh_queue()
+
+    def _on_queue_move_up(self, item_id: str) -> None:
+        self._queue_items = [item.to_dict() for item in self._queue_runner.move(item_id, -1)]
+        self._refresh_queue()
+
+    def _on_queue_move_down(self, item_id: str) -> None:
+        self._queue_items = [item.to_dict() for item in self._queue_runner.move(item_id, 1)]
+        self._refresh_queue()
+
     def _update_queue_summary(self, items: List[dict]) -> None:
         total = len(items)
         running = sum(1 for item in items if item.get("status") == "running")
@@ -795,24 +818,33 @@ class App(ctk.CTk):
         self._selected_playlist_items = selected_items
         self._set_playlist_selection_state(bool(selected_items), active_item is not None)
         if active_item:
+            self._expected_item_info_request_id = None
+            self._expected_item_info_index = None
             index = active_item.index
             self._current_info = {"title": active_item.title, "duration": active_item.duration}
             cached_info = self._playlist_item_info_cache.get(index)
             if cached_info:
-                self._current_info = dict(cached_info)
-                duration_value = cached_info.get("duration")
-                if isinstance(duration_value, (int, float)):
-                    self.preview_panel.update_item_duration(index, int(duration_value))
+                self._apply_playlist_item_info(index, cached_info, update_current=True)
+            else:
+                self._update_info_display()
+                self._schedule_item_info_fetch(index)
             cached_formats = self._playlist_item_formats_cache.get(index)
             if cached_formats:
                 self._expected_formats_request_id = None
                 self._expected_formats_index = None
                 self._apply_formats(cached_formats)
             else:
-                self._update_info_display()
                 self._schedule_auto_fetch_selected()
         else:
             self._current_info = {}
+            self._expected_item_info_request_id = None
+            self._expected_item_info_index = None
+            if self._item_info_job:
+                try:
+                    self.after_cancel(self._item_info_job)
+                except Exception:
+                    pass
+                self._item_info_job = None
             self._update_info_display()
 
     def _on_load_more_preview(self) -> None:
@@ -932,6 +964,7 @@ class App(ctk.CTk):
     def _update_info_display(self) -> None:
         info = self._current_info or {}
         title = info.get("title") or "—"
+        uploader = self._resolve_uploader(info)
         duration = self._format_duration(info.get("duration"))
         duration_seconds = info.get("duration") if isinstance(info.get("duration"), (int, float)) else None
 
@@ -965,6 +998,7 @@ class App(ctk.CTk):
         self.info_panel.update_values(
             {
                 "title": title,
+                "uploader": uploader,
                 "duration": duration,
                 "resolution": resolution,
                 "format": fmt,
@@ -979,6 +1013,32 @@ class App(ctk.CTk):
             self.after_cancel(self._auto_fetch_job)
         self._auto_fetch_job = self.after(
             self.PLAYLIST_AUTO_FETCH_DELAY_MS, self._auto_fetch_selected_formats
+        )
+
+    def _schedule_item_info_fetch(self, index: int) -> None:
+        if self._item_info_job:
+            self.after_cancel(self._item_info_job)
+        self._item_info_job = self.after(
+            self.PLAYLIST_AUTO_FETCH_DELAY_MS, lambda: self._fetch_selected_item_info(index)
+        )
+
+    def _fetch_selected_item_info(self, index: int) -> None:
+        self._item_info_job = None
+        url = self.playlist_url_var.get().strip()
+        if not url:
+            return
+        if not self._selected_playlist_item or self._selected_playlist_item.index != index:
+            return
+        self._expected_item_info_index = index
+        self._expected_item_info_request_id = self._controller.fetch_item_info(
+            url=url,
+            playlist_mode=True,
+            playlist_items=str(index),
+            cookies=self._normalize_cookies(),
+            js_runtime=self._normalize_js_runtime(),
+            js_runtime_path=self._normalize_runtime_path(),
+            remote_components=self._normalize_remote_components(),
+            index=index,
         )
 
     def _auto_fetch_selected_formats(self) -> None:
@@ -1033,6 +1093,47 @@ class App(ctk.CTk):
     def _estimate_filesize_bytes(tbr_kbps: float, duration_seconds: float) -> int:
         bytes_per_second = (tbr_kbps * 1000) / 8
         return int(bytes_per_second * float(duration_seconds))
+
+    def _apply_playlist_item_info(self, index: Optional[int], info: Dict, update_current: bool) -> None:
+        if index is not None:
+            self._playlist_item_info_cache[index] = dict(info)
+            duration_value = info.get("duration")
+            if isinstance(duration_value, (int, float)):
+                if self.preview_panel:
+                    self.preview_panel.update_item_duration(index, int(duration_value))
+            thumb_url = self._resolve_thumbnail_url(info)
+            if thumb_url and self.preview_panel:
+                self.preview_panel.update_item_thumbnail(index, thumb_url)
+        if update_current:
+            self._current_info = dict(info)
+            self._update_info_display()
+
+    @staticmethod
+    def _resolve_uploader(info: Dict) -> str:
+        for key in ("channel", "uploader", "uploader_id", "channel_id"):
+            value = info.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if value:
+                    return value
+        return "—"
+
+    @staticmethod
+    def _resolve_thumbnail_url(info: Dict) -> Optional[str]:
+        for key in ("thumbnail", "thumbnail_url"):
+            value = info.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if value:
+                    return value
+        thumbs = info.get("thumbnails")
+        if isinstance(thumbs, list) and thumbs:
+            last = thumbs[-1]
+            if isinstance(last, dict):
+                url = last.get("url")
+                if isinstance(url, str) and url.strip():
+                    return url.strip()
+        return None
 
     def _poll_events(self) -> None:
         processed = 0
@@ -1093,6 +1194,14 @@ class App(ctk.CTk):
                     if not append:
                         self._selected_playlist_item = None
                         self._selected_playlist_items = []
+                        self._expected_item_info_request_id = None
+                        self._expected_item_info_index = None
+                        if self._item_info_job:
+                            try:
+                                self.after_cancel(self._item_info_job)
+                            except Exception:
+                                pass
+                            self._item_info_job = None
                         self._set_playlist_selection_state(False, False)
                         self._current_info = {}
                         self._update_info_display()
@@ -1103,13 +1212,22 @@ class App(ctk.CTk):
                         request_id, info = payload
                     if request_id is not None and request_id != self._expected_formats_request_id:
                         continue
-                    self._current_info = dict(info)  # type: ignore[arg-type]
-                    self._update_info_display()
-                    if self._expected_formats_index is not None:
-                        self._playlist_item_info_cache[self._expected_formats_index] = dict(info)  # type: ignore[arg-type]
-                        duration_value = info.get("duration")
-                        if isinstance(duration_value, (int, float)):
-                            self.preview_panel.update_item_duration(self._expected_formats_index, int(duration_value))
+                    index = self._expected_formats_index
+                    self._apply_playlist_item_info(index, dict(info), update_current=True)  # type: ignore[arg-type]
+                elif event == "item_info":
+                    request_id = None
+                    index = None
+                    info = payload
+                    if isinstance(payload, tuple) and len(payload) == 3 and isinstance(payload[0], int):
+                        request_id, index, info = payload
+                    if request_id is not None and request_id != self._expected_item_info_request_id:
+                        continue
+                    update_current = bool(
+                        self._selected_playlist_item
+                        and isinstance(index, int)
+                        and self._selected_playlist_item.index == index
+                    )
+                    self._apply_playlist_item_info(index, dict(info), update_current=update_current)  # type: ignore[arg-type]
                 elif event == "log":
                     self._append_log(str(payload))
                 elif event == "progress":
@@ -1242,8 +1360,11 @@ class App(ctk.CTk):
             on_cancel=self._on_queue_cancel,
             on_clear=self._on_queue_clear,
             on_clear_completed=self._on_queue_clear_completed,
+            on_clear_failed=self._on_queue_clear_failed,
             on_remove=self._on_queue_remove,
             on_retry=self._on_queue_retry,
+            on_move_up=self._on_queue_move_up,
+            on_move_down=self._on_queue_move_down,
         )
         self._queue_page.pack(fill="both", expand=True)
         self._queue_page_built = True

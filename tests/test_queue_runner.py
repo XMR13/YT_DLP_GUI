@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import List, Optional
 
 from controllers.queue_runner import QueueRunner
@@ -126,3 +127,112 @@ def test_queue_runner_failure_marks_failed_and_retry(tmp_path, monkeypatch) -> N
     assert runner.run_next_blocking() is True
     loaded = store.load()
     assert loaded[0].status == "completed"
+
+
+def test_queue_runner_move_queued_only(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    store = QueueStore(app_name="yt-dlp-gui-test")
+    runner = QueueRunner(store, FakeExecutor([]))
+
+    item1 = QueueItem.create(
+        url="https://example.com/1",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+        title="One",
+    )
+    item2 = QueueItem.create(
+        url="https://example.com/2",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+        title="Two",
+    )
+    item3 = QueueItem.create(
+        url="https://example.com/3",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+        title="Three",
+    )
+
+    store.save([item1, replace(item2, status="completed"), item3])
+    runner.move(item3.id, -1)
+
+    loaded = store.load()
+    assert [item.id for item in loaded] == [item3.id, item2.id, item1.id]
+
+
+def test_queue_runner_clear_failed_and_cancelled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    store = QueueStore(app_name="yt-dlp-gui-test")
+    runner = QueueRunner(store, FakeExecutor([]))
+
+    item1 = QueueItem.create(
+        url="https://example.com/1",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+    )
+    item2 = QueueItem.create(
+        url="https://example.com/2",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+    )
+    item3 = QueueItem.create(
+        url="https://example.com/3",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+    )
+
+    store.save(
+        [
+            replace(item1, status="failed"),
+            replace(item2, status="cancelled"),
+            replace(item3, status="queued"),
+        ]
+    )
+    runner.clear_failed()
+
+    loaded = store.load()
+    assert [item.status for item in loaded] == ["queued"]

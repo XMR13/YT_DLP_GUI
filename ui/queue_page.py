@@ -17,8 +17,11 @@ class QueuePage(ctk.CTkFrame):
         on_cancel: Optional[Callable[[], None]] = None,
         on_clear: Optional[Callable[[], None]] = None,
         on_clear_completed: Optional[Callable[[], None]] = None,
+        on_clear_failed: Optional[Callable[[], None]] = None,
         on_remove: Optional[QueueAction] = None,
         on_retry: Optional[QueueAction] = None,
+        on_move_up: Optional[QueueAction] = None,
+        on_move_down: Optional[QueueAction] = None,
         **kwargs: object,
     ) -> None:
         super().__init__(master, **kwargs)
@@ -27,8 +30,11 @@ class QueuePage(ctk.CTkFrame):
         self._on_cancel = on_cancel
         self._on_clear = on_clear
         self._on_clear_completed = on_clear_completed
+        self._on_clear_failed = on_clear_failed
         self._on_remove = on_remove
         self._on_retry = on_retry
+        self._on_move_up = on_move_up
+        self._on_move_down = on_move_down
         self._rows: List[ctk.CTkFrame] = []
         self._badge_colors = {
             "queued": ("#455A64", "#455A64"),
@@ -100,6 +106,14 @@ class QueuePage(ctk.CTkFrame):
         )
         self._clear_done_btn.pack(side="left", padx=4)
 
+        self._clear_failed_btn = ctk.CTkButton(
+            controls,
+            text="Clear failed",
+            width=100,
+            command=self._handle_clear_failed,
+        )
+        self._clear_failed_btn.pack(side="left", padx=4)
+
         self._list = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self._list.pack(fill="both", expand=True)
         self._list_canvas = getattr(self._list, "_parent_canvas", None) or getattr(self._list, "_canvas", None)
@@ -129,8 +143,16 @@ class QueuePage(ctk.CTkFrame):
             return
         self._empty.pack_forget()
 
-        for item in items:
-            row = self._build_row(self._list, item)
+        queued_positions = [
+            idx for idx, item in enumerate(items) if str(item.get("status") or "queued").lower() == "queued"
+        ]
+        queued_lookup = {pos: index for index, pos in enumerate(queued_positions)}
+
+        for position, item in enumerate(items):
+            queued_index = queued_lookup.get(position)
+            can_move_up = queued_index is not None and queued_index > 0
+            can_move_down = queued_index is not None and queued_index < len(queued_positions) - 1
+            row = self._build_row(self._list, item, can_move_up, can_move_down)
             row.pack(fill="x", pady=6, padx=6)
             self._rows.append(row)
 
@@ -140,7 +162,7 @@ class QueuePage(ctk.CTkFrame):
     def get_scroll_canvas(self) -> Optional[object]:
         return self._list_canvas
 
-    def _build_row(self, master: ctk.CTkFrame, item: dict) -> ctk.CTkFrame:
+    def _build_row(self, master: ctk.CTkFrame, item: dict, can_move_up: bool, can_move_down: bool) -> ctk.CTkFrame:
         row = ctk.CTkFrame(master, corner_radius=12)
         row.grid_columnconfigure(0, weight=1)
 
@@ -179,6 +201,24 @@ class QueuePage(ctk.CTkFrame):
         actions.grid(row=0, column=1, rowspan=4, sticky="e", padx=12, pady=10)
 
         item_id = str(item.get("id") or "")
+        if self._on_move_up and can_move_up:
+            move_up_btn = ctk.CTkButton(
+                actions,
+                text="Up",
+                width=60,
+                command=lambda i=item_id: self._on_move_up(i),
+            )
+            move_up_btn.pack(pady=4)
+
+        if self._on_move_down and can_move_down:
+            move_down_btn = ctk.CTkButton(
+                actions,
+                text="Down",
+                width=60,
+                command=lambda i=item_id: self._on_move_down(i),
+            )
+            move_down_btn.pack(pady=4)
+
         if self._on_retry and status in ("failed", "cancelled"):
             retry_btn = ctk.CTkButton(
                 actions,
@@ -243,3 +283,7 @@ class QueuePage(ctk.CTkFrame):
     def _handle_clear_completed(self) -> None:
         if self._on_clear_completed:
             self._on_clear_completed()
+
+    def _handle_clear_failed(self) -> None:
+        if self._on_clear_failed:
+            self._on_clear_failed()

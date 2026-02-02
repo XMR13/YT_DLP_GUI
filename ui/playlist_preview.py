@@ -97,6 +97,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._selected_hover_color = ("#CFCFCF", "#464646")
         self._row_duration: Dict[int, str] = {}
         self._row_size: Dict[int, str] = {}
+        self._thumb_override: Dict[int, str] = {}
         self._total_count = 0
         self._empty_label: Optional[ctk.CTkLabel] = None
         self._canvas_configure_job: Optional[str] = None
@@ -120,6 +121,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._active_index = None
         self._row_duration.clear()
         self._row_size.clear()
+        self._thumb_override.clear()
         self._image_cache.clear()
         self._total_count = total_count if isinstance(total_count, int) and total_count > 0 else len(items)
         self._update_selected_count()
@@ -406,6 +408,22 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._row_duration[index] = self._format_duration(duration_seconds)
         self._render_row_meta(index)
 
+    def update_item_thumbnail(self, index: int, thumbnail_url: Optional[str]) -> None:
+        if thumbnail_url:
+            self._thumb_override[index] = thumbnail_url
+        else:
+            self._thumb_override.pop(index, None)
+        row = self._visible_rows.get(index)
+        if not row:
+            return
+        url = self._thumb_override.get(index)
+        if url:
+            row.thumb_url = url
+            self._load_thumbnail_async(url, row)
+        else:
+            row.thumb.configure(image=self._placeholder)
+            row.thumb.image = self._placeholder
+
     def _render_row_meta(self, index: int) -> None:
         row = self._visible_rows.get(index)
         if not row or not row.meta.winfo_exists():
@@ -485,13 +503,14 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._on_select(active_item, selected_items)
 
     def _render_row(self, row: _RowWidget, item: PlaylistItem) -> None:
-        row.thumb_url = item.thumbnail_url
+        thumb_url = self._thumb_override.get(item.index) or item.thumbnail_url
+        row.thumb_url = thumb_url
         row.title.configure(text=f"{item.index}. {item.title}")
         duration = self._row_duration.get(item.index, self._format_duration(item.duration))
         size_text = self._row_size.get(item.index, "fetch formats")
         row.meta.configure(text=f"Duration: {duration}  •  Size: {size_text}")
-        if item.thumbnail_url:
-            self._load_thumbnail_async(item.thumbnail_url, row)
+        if thumb_url:
+            self._load_thumbnail_async(thumb_url, row)
         else:
             row.thumb.configure(image=self._placeholder)
             row.thumb.image = self._placeholder

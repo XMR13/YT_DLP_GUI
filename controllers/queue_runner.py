@@ -80,6 +80,43 @@ class QueueRunner:
         self._emit_queue_updated(items)
         return items
 
+    def clear_failed(self) -> List[QueueItem]:
+        items = [item for item in self._store.load() if item.status not in ("failed", "cancelled")]
+        self._store.save(items)
+        self._emit_queue_updated(items)
+        return items
+
+    def move(self, item_id: str, direction: int) -> List[QueueItem]:
+        if direction == 0:
+            return self._store.load()
+        items = self._store.load()
+        current_index = None
+        for idx, item in enumerate(items):
+            if item.id == item_id:
+                current_index = idx
+                break
+        if current_index is None:
+            return items
+        if items[current_index].status != "queued":
+            return items
+
+        queued_positions = [idx for idx, item in enumerate(items) if item.status == "queued"]
+        try:
+            queued_index = queued_positions.index(current_index)
+        except ValueError:
+            return items
+
+        step = -1 if direction < 0 else 1
+        target_index = queued_index + step
+        if target_index < 0 or target_index >= len(queued_positions):
+            return items
+
+        swap_pos = queued_positions[target_index]
+        items[current_index], items[swap_pos] = items[swap_pos], items[current_index]
+        self._store.save(items)
+        self._emit_queue_updated(items)
+        return items
+
     def start(self) -> None:
         with self._lock:
             self._run_requested = True

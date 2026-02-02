@@ -18,6 +18,8 @@ class DownloadController:
         self._cancel_requested = False
         self._formats_request_id = 0
         self._formats_lock = threading.Lock()
+        self._info_request_id = 0
+        self._info_lock = threading.Lock()
 
     def fetch_formats(
         self,
@@ -65,6 +67,37 @@ class DownloadController:
             args=(url, cookies, js_runtime, js_runtime_path, remote_components, start, limit, append),
             daemon=True,
         ).start()
+
+    def fetch_item_info(
+        self,
+        url: str,
+        playlist_mode: bool,
+        playlist_items: Optional[str],
+        cookies: Optional[str],
+        js_runtime: Optional[str],
+        js_runtime_path: Optional[str],
+        remote_components: Optional[str],
+        index: int,
+    ) -> int:
+        with self._info_lock:
+            self._info_request_id += 1
+            request_id = self._info_request_id
+        threading.Thread(
+            target=self._fetch_item_info_worker,
+            args=(
+                request_id,
+                index,
+                url,
+                playlist_mode,
+                playlist_items,
+                cookies,
+                js_runtime,
+                js_runtime_path,
+                remote_components,
+            ),
+            daemon=True,
+        ).start()
+        return request_id
 
     def start_download(
         self,
@@ -134,6 +167,34 @@ class DownloadController:
             self._events.put(("error", str(exc)))
         finally:
             self._events.put(("busy", (False, None)))
+
+    def _fetch_item_info_worker(
+        self,
+        request_id: int,
+        index: int,
+        url: str,
+        playlist_mode: bool,
+        playlist_items: Optional[str],
+        cookies: Optional[str],
+        js_runtime: Optional[str],
+        js_runtime_path: Optional[str],
+        remote_components: Optional[str],
+    ) -> None:
+        try:
+            info = self._adapter.fetch_info(
+                url,
+                playlist_mode,
+                playlist_items,
+                cookies,
+                js_runtime,
+                js_runtime_path,
+                remote_components,
+            )
+            self._events.put(("item_info", (request_id, index, info)))
+            title = info.get("title") or f"Item {index}"
+            self._events.put(("log", f"Item details loaded: {title}"))
+        except Exception as exc:  # noqa: BLE001 - UI surface for any failures.
+            self._events.put(("error", str(exc)))
 
     def _download_worker(
         self,

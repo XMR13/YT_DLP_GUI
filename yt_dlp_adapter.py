@@ -83,7 +83,7 @@ class YtDlpAdapter:
             args.extend(["--cookies-from-browser", cookies_from_browser])
         self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
 
-        self._log("Fetching format info...")
+        self._log("Fetching info...")
         result = subprocess.run(
             args,
             check=True,

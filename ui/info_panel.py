@@ -15,6 +15,7 @@ class InfoPanel(ctk.CTkFrame):
         self.values: Dict[str, ctk.CTkLabel] = {}
         info_fields = [
             ("Title", "title"),
+            ("Uploader", "uploader"),
             ("Duration", "duration"),
             ("Resolution / FPS", "resolution"),
             ("Format", "format"),
