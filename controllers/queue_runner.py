@@ -117,6 +117,47 @@ class QueueRunner:
         self._emit_queue_updated(items)
         return items
 
+    def move_to_top(self, item_id: str) -> List[QueueItem]:
+        return self._move_to_queued_index(item_id, 0)
+
+    def move_to_bottom(self, item_id: str) -> List[QueueItem]:
+        items = self._store.load()
+        queued_positions = [idx for idx, item in enumerate(items) if item.status == "queued"]
+        if not queued_positions:
+            return items
+        return self._move_to_queued_index(item_id, len(queued_positions) - 1)
+
+    def _move_to_queued_index(self, item_id: str, target_queued_index: int) -> List[QueueItem]:
+        items = self._store.load()
+        current_index = None
+        for idx, item in enumerate(items):
+            if item.id == item_id:
+                current_index = idx
+                break
+        if current_index is None:
+            return items
+        if items[current_index].status != "queued":
+            return items
+
+        queued_positions = [idx for idx, item in enumerate(items) if item.status == "queued"]
+        try:
+            current_queued_index = queued_positions.index(current_index)
+        except ValueError:
+            return items
+        if target_queued_index < 0 or target_queued_index >= len(queued_positions):
+            return items
+        if current_queued_index == target_queued_index:
+            return items
+
+        queued_items = [items[idx] for idx in queued_positions]
+        moving = queued_items.pop(current_queued_index)
+        queued_items.insert(target_queued_index, moving)
+        for pos, queued_item in zip(queued_positions, queued_items):
+            items[pos] = queued_item
+        self._store.save(items)
+        self._emit_queue_updated(items)
+        return items
+
     def start(self) -> None:
         with self._lock:
             self._run_requested = True

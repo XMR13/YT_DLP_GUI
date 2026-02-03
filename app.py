@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+import re
 import sys
 import os
 import shutil
@@ -32,6 +33,11 @@ if TYPE_CHECKING:
     from ui.playlist_preview import PlaylistPreviewPanel
     from ui.history_page import HistoryPage
     from ui.queue_page import QueuePage
+
+
+PROGRESS_PERCENT_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+PROGRESS_SPEED_RE = re.compile(r"\bat\s+([^\s]+)")
+PROGRESS_ETA_RE = re.compile(r"\bETA\s+([0-9:]+|Unknown)")
 
 
 class App(ctk.CTk):
@@ -78,6 +84,9 @@ class App(ctk.CTk):
         self._history_page_built = False
         self._queue_page_built = False
         self._queue_items: List[dict] = []
+        self._queue_running_id: Optional[str] = None
+        self._queue_running_title: Optional[str] = None
+        self._progress_detail: Dict[str, Optional[str]] = {"percent": None, "speed": None, "eta": None}
         self._closing = False
         self._build_job: Optional[str] = None
         self._build_queue_job: Optional[str] = None
@@ -339,6 +348,8 @@ class App(ctk.CTk):
             self._wheel_remainders[canvas] = remainder
             if self.preview_panel and canvas == self.preview_panel.get_scroll_canvas():
                 self.preview_panel.on_canvas_scroll()
+            if self._queue_page and canvas == self._queue_page.get_scroll_canvas():
+                self._queue_page.on_canvas_scroll()
             return "break"
 
         self.bind_all("<MouseWheel>", on_mousewheel)
@@ -690,8 +701,16 @@ class App(ctk.CTk):
         self._queue_items = [item.to_dict() for item in self._queue_runner.move(item_id, -1)]
         self._refresh_queue()
 
+    def _on_queue_move_top(self, item_id: str) -> None:
+        self._queue_items = [item.to_dict() for item in self._queue_runner.move_to_top(item_id)]
+        self._refresh_queue()
+
     def _on_queue_move_down(self, item_id: str) -> None:
         self._queue_items = [item.to_dict() for item in self._queue_runner.move(item_id, 1)]
+        self._refresh_queue()
+
+    def _on_queue_move_bottom(self, item_id: str) -> None:
+        self._queue_items = [item.to_dict() for item in self._queue_runner.move_to_bottom(item_id)]
         self._refresh_queue()
 
     def _update_queue_summary(self, items: List[dict]) -> None:
@@ -699,6 +718,7 @@ class App(ctk.CTk):
         running = sum(1 for item in items if item.get("status") == "running")
         queued = sum(1 for item in items if item.get("status") == "queued")
         run_requested = self._queue_runner.is_running_requested()
+        running_item = next((item for item in items if item.get("status") == "running"), None)
         if running and run_requested:
             state_label = "Running"
         elif running and not run_requested:
@@ -710,14 +730,25 @@ class App(ctk.CTk):
         summary = f"Queue: {total} • {state_label}"
         if total:
             summary = f"Queue: {total} • {queued} queued • {running} running • {state_label}"
-            running_item = next((item for item in items if item.get("status") == "running"), None)
-            if running_item:
-                title = str(running_item.get("title") or running_item.get("url") or "").strip()
-                if len(title) > 48:
-                    title = title[:45] + "..."
-                if title:
-                    summary = f"{summary} • {title}"
+        running_id = str(running_item.get("id") or "") if running_item else None
+        if running_id != self._queue_running_id:
+            self._queue_running_id = running_id
+            self._progress_detail = {"percent": None, "speed": None, "eta": None}
+        if running_item:
+            title = str(running_item.get("title") or running_item.get("url") or "").strip()
+            if len(title) > 48:
+                summary_title = title[:45] + "..."
+            else:
+                summary_title = title
+            if summary_title:
+                summary = f"{summary} • {summary_title}"
+            if len(title) > 64:
+                title = title[:61] + "..."
+            self._queue_running_title = title or None
+        else:
+            self._queue_running_title = None
         self.status_panel.set_queue_summary(summary)
+        self._update_status_activity()
 
     def _prepare_history_context(
         self,
@@ -944,10 +975,53 @@ class App(ctk.CTk):
             )
             self._append_log(hint)
         self.status_panel.append(message)
+        self._maybe_update_progress_detail(message)
         if self._log_file:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._log_file.write(f"[{timestamp}] {message}\n")
             self._log_file.flush()
+
+    def _maybe_update_progress_detail(self, message: str) -> None:
+        if "[download]" not in message:
+            return
+        updated = False
+        match = PROGRESS_PERCENT_RE.search(message)
+        if match:
+            percent = f"{int(float(match.group(1)))}%"
+            if percent != self._progress_detail.get("percent"):
+                self._progress_detail["percent"] = percent
+                updated = True
+        match = PROGRESS_SPEED_RE.search(message)
+        if match:
+            speed = match.group(1)
+            if speed != self._progress_detail.get("speed"):
+                self._progress_detail["speed"] = speed
+                updated = True
+        match = PROGRESS_ETA_RE.search(message)
+        if match:
+            eta = match.group(1)
+            if eta != self._progress_detail.get("eta"):
+                self._progress_detail["eta"] = eta
+                updated = True
+        if updated:
+            self._update_status_activity()
+
+    def _update_status_activity(self) -> None:
+        title = self._queue_running_title
+        percent = self._progress_detail.get("percent")
+        speed = self._progress_detail.get("speed")
+        eta = self._progress_detail.get("eta")
+        parts = [part for part in (percent, speed, f"ETA {eta}" if eta else None) if part]
+        detail = " • ".join(parts)
+        if title:
+            label = f"Now: {title}"
+            if detail:
+                label = f"{label} — {detail}"
+        elif detail:
+            label = f"Now: {detail}"
+        else:
+            label = "Now: Idle"
+        self.status_panel.set_activity(label)
 
     def _update_progress(self, value: float) -> None:
         value = max(0.0, min(1.0, value))
@@ -1363,8 +1437,10 @@ class App(ctk.CTk):
             on_clear_failed=self._on_queue_clear_failed,
             on_remove=self._on_queue_remove,
             on_retry=self._on_queue_retry,
+            on_move_top=self._on_queue_move_top,
             on_move_up=self._on_queue_move_up,
             on_move_down=self._on_queue_move_down,
+            on_move_bottom=self._on_queue_move_bottom,
         )
         self._queue_page.pack(fill="both", expand=True)
         self._queue_page_built = True
