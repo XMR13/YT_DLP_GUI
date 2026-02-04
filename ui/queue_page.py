@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 import tkinter as tk
@@ -8,6 +9,16 @@ import customtkinter as ctk
 
 
 QueueAction = Callable[[str], None]
+QueueMoveAction = Callable[[str, int], None]
+
+
+@dataclass
+class _DragCandidate:
+    item_id: str
+    start_x: int
+    start_y: int
+    source_index: int
+    source_queued_index: int
 
 
 @dataclass
@@ -32,6 +43,9 @@ class _QueueRowWidget:
 class QueuePage(ctk.CTkFrame):
     ROW_HEIGHT = 170
     ROW_PADDING_Y = 8
+    DRAG_THRESHOLD = 6
+    DRAG_SCROLL_MARGIN = 36
+    DRAG_SCROLL_STEP = 3
 
     def __init__(
         self,
@@ -48,6 +62,7 @@ class QueuePage(ctk.CTkFrame):
         on_move_up: Optional[QueueAction] = None,
         on_move_down: Optional[QueueAction] = None,
         on_move_bottom: Optional[QueueAction] = None,
+        on_move_to_index: Optional[QueueMoveAction] = None,
         **kwargs: object,
     ) -> None:
         super().__init__(master, **kwargs)
@@ -63,6 +78,7 @@ class QueuePage(ctk.CTkFrame):
         self._on_move_up = on_move_up
         self._on_move_down = on_move_down
         self._on_move_bottom = on_move_bottom
+        self._on_move_to_index = on_move_to_index
 
         self._badge_colors = {
             "queued": ("#455A64", "#455A64"),
@@ -78,6 +94,14 @@ class QueuePage(ctk.CTkFrame):
         self._visible_rows: dict[int, _QueueRowWidget] = {}
         self._empty_label: Optional[ctk.CTkLabel] = None
         self._canvas_configure_job: Optional[str] = None
+        self._drag_candidate: Optional[_DragCandidate] = None
+        self._drag_active = False
+        self._drag_item_id: Optional[str] = None
+        self._drag_source_queued_index: Optional[int] = None
+        self._drag_target_slot: Optional[int] = None
+        self._drag_indicator_id: Optional[int] = None
+        self._drag_scroll_job: Optional[str] = None
+        self._drag_pointer_y_widget: Optional[int] = None
         self._build()
 
     def _build(self) -> None:
@@ -184,6 +208,8 @@ class QueuePage(ctk.CTkFrame):
             if str(item.get("status") or "queued").lower() == "queued"
         ]
         self._queued_lookup = {pos: index for index, pos in enumerate(self._queued_positions)}
+        if self._drag_active and self._drag_item_id:
+            self._sync_drag_source()
 
         self._sync_empty_state()
         self._update_scrollregion()
@@ -276,7 +302,7 @@ class QueuePage(ctk.CTkFrame):
         btn_retry = ctk.CTkButton(actions, text="Retry", width=80)
         btn_remove = ctk.CTkButton(actions, text="Remove", width=80)
 
-        return _QueueRowWidget(
+        row_widget = _QueueRowWidget(
             frame=row,
             window_id=window_id,
             title=title,
@@ -292,6 +318,243 @@ class QueuePage(ctk.CTkFrame):
             btn_retry=btn_retry,
             btn_remove=btn_remove,
         )
+        self._bind_drag_sources(row_widget)
+        return row_widget
+
+    def _bind_drag_sources(self, row: _QueueRowWidget) -> None:
+        if not self._on_move_to_index:
+            return
+        widgets = [row.frame, row.title, row.badge, row.badge_text, row.url, row.output]
+        for widget in widgets:
+            widget.bind("<ButtonPress-1>", lambda event, r=row: self._on_row_press(event, r))
+            widget.bind("<B1-Motion>", lambda event, r=row: self._on_row_motion(event, r))
+            widget.bind("<ButtonRelease-1>", lambda event, r=row: self._on_row_release(event, r))
+            try:
+                widget.configure(cursor="hand2")
+            except Exception:
+                pass
+
+    def _on_row_press(self, event: tk.Event, row: _QueueRowWidget) -> None:
+        if not self._on_move_to_index:
+            return
+        index = row.bound_index
+        if index is None:
+            return
+        item = self._items[index]
+        if str(item.get("status") or "queued").lower() != "queued":
+            return
+        if len(self._queued_positions) <= 1:
+            return
+        item_id = str(item.get("id") or "")
+        if not item_id:
+            return
+        source_queued_index = self._queued_lookup.get(index)
+        if source_queued_index is None:
+            return
+        self._drag_candidate = _DragCandidate(
+            item_id=item_id,
+            start_x=event.x_root,
+            start_y=event.y_root,
+            source_index=index,
+            source_queued_index=source_queued_index,
+        )
+        self._drag_pointer_y_widget = self._event_y_widget(event)
+
+    def _on_row_motion(self, event: tk.Event, _row: _QueueRowWidget) -> None:
+        if not self._drag_candidate:
+            return
+        self._drag_pointer_y_widget = self._event_y_widget(event)
+        if not self._drag_active:
+            dx = abs(event.x_root - self._drag_candidate.start_x)
+            dy = abs(event.y_root - self._drag_candidate.start_y)
+            if max(dx, dy) < self.DRAG_THRESHOLD:
+                return
+            self._begin_drag()
+        self._update_drag_indicator()
+
+    def _on_row_release(self, event: tk.Event, _row: _QueueRowWidget) -> None:
+        if not self._drag_candidate:
+            return
+        self._drag_pointer_y_widget = self._event_y_widget(event)
+        if not self._drag_active:
+            self._drag_candidate = None
+            return
+        self._finish_drag()
+
+    def _event_y_widget(self, event: tk.Event) -> int:
+        return int(event.y_root - self._list_canvas.winfo_rooty())
+
+    def _begin_drag(self) -> None:
+        if not self._drag_candidate:
+            return
+        self._drag_active = True
+        self._drag_item_id = self._drag_candidate.item_id
+        self._drag_source_queued_index = self._drag_candidate.source_queued_index
+        self._drag_target_slot = None
+        try:
+            self._list_canvas.configure(cursor="fleur")
+        except Exception:
+            pass
+        self._start_drag_scroll()
+
+    def _finish_drag(self) -> None:
+        item_id = self._drag_item_id
+        source_index = self._drag_source_queued_index
+        slot = self._queued_slot_for_pointer()
+        total = len(self._queued_positions)
+        if (
+            item_id
+            and slot is not None
+            and source_index is not None
+            and total > 1
+            and self._on_move_to_index
+        ):
+            target_index = self._target_index_from_slot(slot, source_index, total)
+            if target_index != source_index:
+                self._on_move_to_index(item_id, target_index)
+        self._cancel_drag()
+
+    def _cancel_drag(self) -> None:
+        self._drag_candidate = None
+        self._drag_active = False
+        self._drag_item_id = None
+        self._drag_source_queued_index = None
+        self._drag_target_slot = None
+        self._drag_pointer_y_widget = None
+        if self._drag_scroll_job:
+            try:
+                self.after_cancel(self._drag_scroll_job)
+            except Exception:
+                pass
+            self._drag_scroll_job = None
+        self._hide_drag_indicator()
+        try:
+            self._list_canvas.configure(cursor="")
+        except Exception:
+            pass
+
+    def _sync_drag_source(self) -> None:
+        if not self._drag_item_id:
+            return
+        for index, item in enumerate(self._items):
+            if str(item.get("id") or "") == self._drag_item_id:
+                self._drag_source_queued_index = self._queued_lookup.get(index)
+                return
+        self._cancel_drag()
+
+    def _start_drag_scroll(self) -> None:
+        if self._drag_scroll_job:
+            return
+        self._drag_scroll_job = self.after(16, self._drag_scroll_tick)
+
+    def _drag_scroll_tick(self) -> None:
+        if not self._drag_active:
+            self._drag_scroll_job = None
+            return
+        height = max(self._list_canvas.winfo_height(), 1)
+        y_widget = self._drag_pointer_y_widget
+        if y_widget is None:
+            y_widget = 0
+        y_widget = max(0, min(y_widget, height))
+        scroll_step = 0
+        if y_widget < self.DRAG_SCROLL_MARGIN:
+            scroll_step = -self.DRAG_SCROLL_STEP
+        elif y_widget > height - self.DRAG_SCROLL_MARGIN:
+            scroll_step = self.DRAG_SCROLL_STEP
+        if scroll_step:
+            self._list_canvas.yview_scroll(scroll_step, "units")
+            self._update_visible_rows()
+        self._update_drag_indicator()
+        self._drag_scroll_job = self.after(16, self._drag_scroll_tick)
+
+    def _queued_slot_for_pointer(self) -> Optional[int]:
+        if not self._queued_positions:
+            return None
+        y_widget = self._drag_pointer_y_widget
+        if y_widget is None:
+            return None
+        y_canvas = self._list_canvas.canvasy(y_widget)
+        total_height = len(self._items) * self.ROW_HEIGHT + self.ROW_PADDING_Y
+        y_canvas = max(0, min(y_canvas, total_height))
+        row_index = int(max(0, min(len(self._items) - 1, (y_canvas - self.ROW_PADDING_Y) // self.ROW_HEIGHT)))
+        offset = y_canvas - (row_index * self.ROW_HEIGHT + self.ROW_PADDING_Y)
+        before_count = bisect_left(self._queued_positions, row_index)
+        is_queued_row = row_index in self._queued_lookup
+        if is_queued_row and offset > (self.ROW_HEIGHT / 2):
+            slot = before_count + 1
+        else:
+            slot = before_count
+        return max(0, min(slot, len(self._queued_positions)))
+
+    def _target_index_from_slot(self, slot: int, source_index: int, total: int) -> int:
+        if total <= 1:
+            return source_index
+        if slot <= source_index:
+            target = slot
+        else:
+            target = slot - 1
+        if target < 0:
+            target = 0
+        if target >= total:
+            target = total - 1
+        return target
+
+    def _update_drag_indicator(self) -> None:
+        slot = self._queued_slot_for_pointer()
+        if slot is None:
+            self._hide_drag_indicator()
+            return
+        if slot != self._drag_target_slot or self._drag_indicator_id is None:
+            self._drag_target_slot = slot
+            self._draw_drag_indicator(slot)
+
+    def _draw_drag_indicator(self, slot: int) -> None:
+        y = self._indicator_y_for_slot(slot)
+        if y is None:
+            self._hide_drag_indicator()
+            return
+        width = max(self._list_canvas.winfo_width(), 1)
+        x0 = 10
+        x1 = max(x0 + 10, width - 10)
+        color = "#4FC3F7" if ctk.get_appearance_mode() == "Dark" else "#1E88E5"
+        if self._drag_indicator_id is None:
+            self._drag_indicator_id = self._list_canvas.create_line(
+                x0,
+                y,
+                x1,
+                y,
+                fill=color,
+                width=3,
+            )
+        else:
+            self._list_canvas.coords(self._drag_indicator_id, x0, y, x1, y)
+        try:
+            self._list_canvas.tag_raise(self._drag_indicator_id)
+        except Exception:
+            pass
+
+    def _indicator_y_for_slot(self, slot: int) -> Optional[float]:
+        if not self._queued_positions:
+            return None
+        if slot <= 0:
+            target_index = self._queued_positions[0]
+            y = target_index * self.ROW_HEIGHT + self.ROW_PADDING_Y - 2
+        elif slot >= len(self._queued_positions):
+            target_index = self._queued_positions[-1]
+            y = target_index * self.ROW_HEIGHT + self.ROW_PADDING_Y + self.ROW_HEIGHT - 2
+        else:
+            target_index = self._queued_positions[slot]
+            y = target_index * self.ROW_HEIGHT + self.ROW_PADDING_Y - 2
+        return max(2, y)
+
+    def _hide_drag_indicator(self) -> None:
+        if self._drag_indicator_id is None:
+            return
+        try:
+            self._list_canvas.delete(self._drag_indicator_id)
+        except Exception:
+            pass
+        self._drag_indicator_id = None
 
     def _update_scrollregion(self) -> None:
         total_height = max(1, len(self._items) * self.ROW_HEIGHT + self.ROW_PADDING_Y)
@@ -315,6 +578,8 @@ class QueuePage(ctk.CTkFrame):
                 self._list_canvas.itemconfigure(row.window_id, width=width)
             except Exception:
                 pass
+        if self._drag_active and self._drag_target_slot is not None:
+            self._draw_drag_indicator(self._drag_target_slot)
         self._ensure_row_pool()
 
     def _update_visible_rows(self) -> None:
@@ -323,6 +588,7 @@ class QueuePage(ctk.CTkFrame):
                 self._list_canvas.itemconfigure(row.window_id, state="hidden")
                 row.bound_index = None
             self._visible_rows.clear()
+            self._hide_drag_indicator()
             return
 
         y0 = self._list_canvas.canvasy(0)
