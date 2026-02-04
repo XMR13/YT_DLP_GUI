@@ -127,6 +127,9 @@ class QueueRunner:
             return items
         return self._move_to_queued_index(item_id, len(queued_positions) - 1)
 
+    def move_to_queued_index(self, item_id: str, target_queued_index: int) -> List[QueueItem]:
+        return self._move_to_queued_index(item_id, target_queued_index)
+
     def _move_to_queued_index(self, item_id: str, target_queued_index: int) -> List[QueueItem]:
         items = self._store.load()
         current_index = None

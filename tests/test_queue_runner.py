@@ -281,6 +281,105 @@ def test_queue_runner_move_top_bottom(tmp_path, monkeypatch) -> None:
     assert [item.id for item in loaded] == [item3.id, item2.id, item4.id, item1.id, item5.id]
 
 
+def test_queue_runner_move_to_queued_index(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    store = QueueStore(app_name="yt-dlp-gui-test")
+    runner = QueueRunner(store, FakeExecutor([]))
+
+    item1 = QueueItem.create(
+        url="https://example.com/1",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+        title="One",
+    )
+    item2 = QueueItem.create(
+        url="https://example.com/2",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+        title="Two",
+    )
+    item3 = QueueItem.create(
+        url="https://example.com/3",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+        title="Three",
+    )
+    item4 = QueueItem.create(
+        url="https://example.com/4",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+        title="Four",
+    )
+    item5 = QueueItem.create(
+        url="https://example.com/5",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+        title="Five",
+    )
+
+    store.save(
+        [
+            item1,
+            replace(item2, status="completed"),
+            item3,
+            item4,
+            replace(item5, status="cancelled"),
+        ]
+    )
+    runner.move_to_queued_index(item1.id, 2)
+    loaded = store.load()
+    assert [item.id for item in loaded] == [item3.id, item2.id, item4.id, item1.id, item5.id]
+
+    store.save(
+        [
+            item1,
+            replace(item2, status="completed"),
+            item3,
+            item4,
+            replace(item5, status="cancelled"),
+        ]
+    )
+    runner.move_to_queued_index(item4.id, 1)
+    loaded = store.load()
+    assert [item.id for item in loaded] == [item1.id, item2.id, item4.id, item3.id, item5.id]
+
+
 def test_queue_runner_clear_failed_and_cancelled(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     monkeypatch.setenv("APPDATA", str(tmp_path))

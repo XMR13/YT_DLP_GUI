@@ -713,6 +713,13 @@ class App(ctk.CTk):
         self._queue_items = [item.to_dict() for item in self._queue_runner.move_to_bottom(item_id)]
         self._refresh_queue()
 
+    def _on_queue_move_to_index(self, item_id: str, target_queued_index: int) -> None:
+        self._queue_items = [
+            item.to_dict()
+            for item in self._queue_runner.move_to_queued_index(item_id, target_queued_index)
+        ]
+        self._refresh_queue()
+
     def _update_queue_summary(self, items: List[dict]) -> None:
         total = len(items)
         running = sum(1 for item in items if item.get("status") == "running")
@@ -1441,6 +1448,7 @@ class App(ctk.CTk):
             on_move_up=self._on_queue_move_up,
             on_move_down=self._on_queue_move_down,
             on_move_bottom=self._on_queue_move_bottom,
+            on_move_to_index=self._on_queue_move_to_index,
         )
         self._queue_page.pack(fill="both", expand=True)
         self._queue_page_built = True

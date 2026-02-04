@@ -1,7 +1,7 @@
 [project]
 name = "yt-dlp-gui"
 version = "0.1.0"
-description = "Add your description here"
+description = "A personal project to create a user-friendly UI interface for yl-dlp"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
