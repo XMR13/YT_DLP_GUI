@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Set
 import tkinter as tk
 
 import customtkinter as ctk
@@ -10,6 +10,8 @@ import customtkinter as ctk
 
 QueueAction = Callable[[str], None]
 QueueMoveAction = Callable[[str, int], None]
+QueueBulkAction = Callable[[List[str]], None]
+QueueBulkMoveAction = Callable[[List[str]], None]
 
 
 @dataclass
@@ -54,6 +56,10 @@ class QueuePage(ctk.CTkFrame):
         on_clear_failed: Optional[Callable[[], None]] = None,
         on_remove: Optional[QueueAction] = None,
         on_retry: Optional[QueueAction] = None,
+        on_bulk_remove: Optional[QueueBulkAction] = None,
+        on_bulk_retry: Optional[QueueBulkAction] = None,
+        on_bulk_move_top: Optional[QueueBulkMoveAction] = None,
+        on_bulk_move_bottom: Optional[QueueBulkMoveAction] = None,
         on_move_to_index: Optional[QueueMoveAction] = None,
         **kwargs: object,
     ) -> None:
@@ -66,6 +72,10 @@ class QueuePage(ctk.CTkFrame):
         self._on_clear_failed = on_clear_failed
         self._on_remove = on_remove
         self._on_retry = on_retry
+        self._on_bulk_remove = on_bulk_remove
+        self._on_bulk_retry = on_bulk_retry
+        self._on_bulk_move_top = on_bulk_move_top
+        self._on_bulk_move_bottom = on_bulk_move_bottom
         self._on_move_to_index = on_move_to_index
 
         self._badge_colors = {
@@ -82,9 +92,13 @@ class QueuePage(ctk.CTkFrame):
             "cancelled": "Canceled",
             "failed": "Failed",
         }
+        self._row_color = ("#F2F2F2", "#2B2B2B")
+        self._selected_color = ("#D8D8D8", "#3A3A3A")
         self._items: List[dict] = []
         self._queued_positions: List[int] = []
         self._queued_lookup: dict[int, int] = {}
+        self._selected_ids: Set[str] = set()
+        self._selection_order: List[str] = []
         self._row_pool: List[_QueueRowWidget] = []
         self._visible_rows: dict[int, _QueueRowWidget] = {}
         self._empty_label: Optional[ctk.CTkLabel] = None
@@ -168,6 +182,54 @@ class QueuePage(ctk.CTkFrame):
         )
         self._clear_failed_btn.pack(side="left", padx=4)
 
+        self._selection_bar = ctk.CTkFrame(self, fg_color="transparent")
+        self._selection_label = ctk.CTkLabel(
+            self._selection_bar,
+            text="0 selected",
+            font=ctk.CTkFont("Segoe UI", 12),
+        )
+        self._selection_label.pack(side="left", padx=(6, 12))
+
+        self._bulk_retry_btn = ctk.CTkButton(
+            self._selection_bar,
+            text="Retry selected",
+            width=120,
+            command=self._handle_bulk_retry,
+        )
+        self._bulk_retry_btn.pack(side="left", padx=4)
+
+        self._bulk_move_top_btn = ctk.CTkButton(
+            self._selection_bar,
+            text="Move to top",
+            width=110,
+            command=self._handle_bulk_move_top,
+        )
+        self._bulk_move_top_btn.pack(side="left", padx=4)
+
+        self._bulk_move_bottom_btn = ctk.CTkButton(
+            self._selection_bar,
+            text="Move to bottom",
+            width=130,
+            command=self._handle_bulk_move_bottom,
+        )
+        self._bulk_move_bottom_btn.pack(side="left", padx=4)
+
+        self._bulk_remove_btn = ctk.CTkButton(
+            self._selection_bar,
+            text="Remove selected",
+            width=130,
+            command=self._handle_bulk_remove,
+        )
+        self._bulk_remove_btn.pack(side="left", padx=4)
+
+        self._clear_selection_btn = ctk.CTkButton(
+            self._selection_bar,
+            text="Clear selection",
+            width=130,
+            command=self.clear_selection,
+        )
+        self._clear_selection_btn.pack(side="left", padx=4)
+
         self.progress = ctk.CTkProgressBar(self, height=8)
         self.progress.pack(fill="x", padx=12, pady=(0, 6))
         self.progress.set(0)
@@ -234,12 +296,14 @@ class QueuePage(ctk.CTkFrame):
             if str(item.get("status") or "queued").lower() == "queued"
         ]
         self._queued_lookup = {pos: index for index, pos in enumerate(self._queued_positions)}
+        self._sync_selection_with_items()
         if self._drag_active and self._drag_item_id:
             self._sync_drag_source()
 
         self._sync_empty_state()
         self._update_scrollregion()
         self._ensure_row_pool()
+        self._sync_selection_bar()
 
     def get_scroll_frame(self) -> tk.Canvas:
         return self._list_canvas
@@ -382,7 +446,14 @@ class QueuePage(ctk.CTkFrame):
         self._on_row_motion(event, None)  # type: ignore[arg-type]
 
     def _on_canvas_release(self, event: tk.Event) -> None:
-        self._on_row_release(event, None)  # type: ignore[arg-type]
+        if self._drag_candidate:
+            self._on_row_release(event, None)  # type: ignore[arg-type]
+            return
+        index = int(self._list_canvas.canvasy(event.y) // self.ROW_HEIGHT)
+        if index < 0 or index >= len(self._items):
+            self.clear_selection()
+            return
+        self._toggle_select(index)
 
     def _on_row_press(self, event: tk.Event, row: _QueueRowWidget) -> None:
         if not self._on_move_to_index:
@@ -423,11 +494,16 @@ class QueuePage(ctk.CTkFrame):
         self._update_drag_indicator()
 
     def _on_row_release(self, event: tk.Event, _row: _QueueRowWidget) -> None:
+        row = _row
         if not self._drag_candidate:
+            if row and row.bound_index is not None:
+                self._toggle_select(row.bound_index)
             return
         self._drag_pointer_y_widget = self._event_y_widget(event)
         if not self._drag_active:
             self._drag_candidate = None
+            if row and row.bound_index is not None:
+                self._toggle_select(row.bound_index)
             return
         self._finish_drag()
 
@@ -686,6 +762,7 @@ class QueuePage(ctk.CTkFrame):
             status,
             item_id,
         )
+        self._apply_row_state(row, item_id)
 
     def _sync_actions(
         self,
@@ -713,6 +790,17 @@ class QueuePage(ctk.CTkFrame):
             show(row.btn_remove, True)
         else:
             hide(row.btn_remove)
+
+    def _apply_row_state(self, row: _QueueRowWidget, item_id: str) -> None:
+        selected = item_id in self._selected_ids
+        bg = self._get_selected_bg() if selected else self._get_row_bg()
+        row.frame.configure(fg_color=bg)
+
+    def _get_row_bg(self) -> str:
+        return self._row_color[1] if ctk.get_appearance_mode() == "Dark" else self._row_color[0]
+
+    def _get_selected_bg(self) -> str:
+        return self._selected_color[1] if ctk.get_appearance_mode() == "Dark" else self._selected_color[0]
 
     @staticmethod
     def _format_output(item: dict) -> str:
@@ -769,3 +857,75 @@ class QueuePage(ctk.CTkFrame):
     def _handle_clear_failed(self) -> None:
         if self._on_clear_failed:
             self._on_clear_failed()
+
+    def _toggle_select(self, index: int) -> None:
+        item = self._items[index]
+        item_id = str(item.get("id") or "")
+        if not item_id:
+            return
+        if item_id in self._selected_ids:
+            self._selected_ids.remove(item_id)
+            if item_id in self._selection_order:
+                self._selection_order.remove(item_id)
+        else:
+            self._selected_ids.add(item_id)
+            self._selection_order.append(item_id)
+        row = self._visible_rows.get(index)
+        if row:
+            self._apply_row_state(row, item_id)
+        self._sync_selection_bar()
+
+    def clear_selection(self) -> None:
+        if not self._selected_ids:
+            return
+        self._selected_ids.clear()
+        self._selection_order.clear()
+        self._update_visible_rows()
+        self._sync_selection_bar()
+
+    def _sync_selection_with_items(self) -> None:
+        valid_ids = {str(item.get("id") or "") for item in self._items if item.get("id")}
+        if not self._selected_ids:
+            return
+        self._selected_ids = {item_id for item_id in self._selected_ids if item_id in valid_ids}
+        self._selection_order = [item_id for item_id in self._selection_order if item_id in self._selected_ids]
+
+    def _sync_selection_bar(self) -> None:
+        count = len(self._selected_ids)
+        if count <= 0:
+            if self._selection_bar.winfo_ismapped():
+                self._selection_bar.pack_forget()
+            return
+        if not self._selection_bar.winfo_ismapped():
+            self._selection_bar.pack(fill="x", padx=6, pady=(0, 6), before=self.progress)
+        self._selection_label.configure(text=f"{count} selected")
+        status_by_id = {str(item.get("id") or ""): str(item.get("status") or "").lower() for item in self._items}
+        retry_enabled = any(
+            status_by_id.get(item_id) in ("failed", "cancelled") for item_id in self._selected_ids
+        )
+        remove_enabled = any(
+            status_by_id.get(item_id) != "running" for item_id in self._selected_ids
+        )
+        move_enabled = any(
+            status_by_id.get(item_id) == "queued" for item_id in self._selected_ids
+        )
+        self._bulk_retry_btn.configure(state="normal" if retry_enabled else "disabled")
+        self._bulk_move_top_btn.configure(state="normal" if move_enabled else "disabled")
+        self._bulk_move_bottom_btn.configure(state="normal" if move_enabled else "disabled")
+        self._bulk_remove_btn.configure(state="normal" if remove_enabled else "disabled")
+
+    def _handle_bulk_retry(self) -> None:
+        if self._on_bulk_retry and self._selected_ids:
+            self._on_bulk_retry(list(self._selection_order))
+
+    def _handle_bulk_remove(self) -> None:
+        if self._on_bulk_remove and self._selected_ids:
+            self._on_bulk_remove(list(self._selection_order))
+
+    def _handle_bulk_move_top(self) -> None:
+        if self._on_bulk_move_top and self._selected_ids:
+            self._on_bulk_move_top(list(self._selection_order))
+
+    def _handle_bulk_move_bottom(self) -> None:
+        if self._on_bulk_move_bottom and self._selected_ids:
+            self._on_bulk_move_bottom(list(self._selection_order))

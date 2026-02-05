@@ -130,6 +130,12 @@ class QueueRunner:
             return items
         return self._move_to_queued_index(item_id, len(queued_positions) - 1)
 
+    def move_many_to_top(self, item_ids: List[str]) -> List[QueueItem]:
+        return self._move_many(item_ids, to_top=True)
+
+    def move_many_to_bottom(self, item_ids: List[str]) -> List[QueueItem]:
+        return self._move_many(item_ids, to_top=False)
+
     def move_to_queued_index(self, item_id: str, target_queued_index: int) -> List[QueueItem]:
         return self._move_to_queued_index(item_id, target_queued_index)
 
@@ -159,6 +165,26 @@ class QueueRunner:
         moving = queued_items.pop(current_queued_index)
         queued_items.insert(target_queued_index, moving)
         for pos, queued_item in zip(queued_positions, queued_items):
+            items[pos] = queued_item
+        self._store.save(items)
+        self._emit_queue_updated(items)
+        return items
+
+    def _move_many(self, item_ids: List[str], *, to_top: bool) -> List[QueueItem]:
+        if not item_ids:
+            return self._store.load()
+        items = self._store.load()
+        queued_positions = [idx for idx, item in enumerate(items) if item.status == "queued"]
+        if not queued_positions:
+            return items
+        queued_items = [items[idx] for idx in queued_positions]
+        selected_set = {item_id for item_id in item_ids if item_id}
+        selected_items = [item for item in queued_items if item.id in selected_set]
+        if not selected_items:
+            return items
+        remaining_items = [item for item in queued_items if item.id not in selected_set]
+        new_order = selected_items + remaining_items if to_top else remaining_items + selected_items
+        for pos, queued_item in zip(queued_positions, new_order):
             items[pos] = queued_item
         self._store.save(items)
         self._emit_queue_updated(items)
@@ -310,12 +336,12 @@ class QueueRunner:
         url = (item.url or "").strip()
 
         if not url:
-            return "Queue item URL is required"
+            return "Queue item URL is required."
         if url.startswith("-"):
-            return "Queue item URL is invalid"
+            return "Queue item URL is invalid."
         output_dir = (item.output_dir or "").strip()
         if not output_dir:
-            return "Queue item output folder is reuqired"
+            return "Queue item output folder is required."
         return None
 
     def _cleanup_completed_if_idle(self, items: List[QueueItem]) -> List[QueueItem]:

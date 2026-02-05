@@ -76,6 +76,7 @@ class App(ctk.CTk):
         self._formats_pending_options: Dict[int, List[FormatOption]] = {}
         self._formats_pending_info: Dict[int, Dict] = {}
         self._formats_inflight_by_index: Dict[int, int] = {}
+        self._info_inflight_by_index: Dict[int, int] = {}
         self._warning_once: set[str] = set()
         self._wheel_remainders: Dict[object, float] = {}
         self._main_scroll_canvas: Optional[tk.Canvas] = None
@@ -517,6 +518,7 @@ class App(ctk.CTk):
         self._selected_playlist_items = []
         self._playlist_item_info_cache.clear()
         self._playlist_item_formats_cache.clear()
+        self._info_inflight_by_index.clear()
         self._expected_formats_request_id = None
         self._expected_formats_index = None
         self._formats_request_index.clear()
@@ -685,10 +687,42 @@ class App(ctk.CTk):
         self._queue_items = [item for item in self._queue_items if item.get("id") != item_id]
         self._refresh_queue()
 
+    def _on_queue_remove_selected(self, item_ids: List[str]) -> None:
+        if not item_ids:
+            return
+        running_ids = {item.get("id") for item in self._queue_items if item.get("status") == "running"}
+        remove_ids = [item_id for item_id in item_ids if item_id and item_id not in running_ids]
+        if not remove_ids:
+            messagebox.showwarning("Item running", "Stop or cancel the current item first.")
+            return
+        if len(remove_ids) != len(item_ids):
+            messagebox.showwarning("Item running", "Running items were skipped.")
+        for item_id in remove_ids:
+            self._queue_runner.remove(item_id)
+        self._queue_items = [item for item in self._queue_items if item.get("id") not in remove_ids]
+        self._refresh_queue()
+
     def _on_queue_retry(self, item_id: str) -> None:
         if not item_id:
             return
         self._queue_runner.retry(item_id)
+        self._queue_runner.start()
+        self._update_queue_summary(self._queue_items)
+
+    def _on_queue_retry_selected(self, item_ids: List[str]) -> None:
+        if not item_ids:
+            return
+        failed_ids = {
+            item.get("id")
+            for item in self._queue_items
+            if item.get("status") in ("failed", "cancelled")
+        }
+        retry_ids = [item_id for item_id in item_ids if item_id in failed_ids]
+        if not retry_ids:
+            messagebox.showinfo("Nothing to retry", "Select failed or cancelled items to retry.")
+            return
+        for item_id in retry_ids:
+            self._queue_runner.retry(item_id)
         self._queue_runner.start()
         self._update_queue_summary(self._queue_items)
 
@@ -713,6 +747,18 @@ class App(ctk.CTk):
 
     def _on_queue_move_bottom(self, item_id: str) -> None:
         self._queue_items = [item.to_dict() for item in self._queue_runner.move_to_bottom(item_id)]
+        self._refresh_queue()
+
+    def _on_queue_move_selected_top(self, item_ids: List[str]) -> None:
+        if not item_ids:
+            return
+        self._queue_items = [item.to_dict() for item in self._queue_runner.move_many_to_top(item_ids)]
+        self._refresh_queue()
+
+    def _on_queue_move_selected_bottom(self, item_ids: List[str]) -> None:
+        if not item_ids:
+            return
+        self._queue_items = [item.to_dict() for item in self._queue_runner.move_many_to_bottom(item_ids)]
         self._refresh_queue()
 
     def _on_queue_move_to_index(self, item_id: str, target_queued_index: int) -> None:
@@ -888,6 +934,19 @@ class App(ctk.CTk):
                 self._apply_playlist_item_info(index, cached_info, update_current=True)
             else:
                 self._update_info_display()
+                url = self.playlist_url_var.get().strip()
+                if url and index not in self._info_inflight_by_index:
+                    request_id = self._controller.fetch_item_info(
+                        url=url,
+                        playlist_mode=True,
+                        playlist_items=str(index),
+                        cookies=self._normalize_cookies(),
+                        js_runtime=self._normalize_js_runtime(),
+                        js_runtime_path=self._normalize_runtime_path(),
+                        remote_components=self._normalize_remote_components(),
+                        index=index,
+                    )
+                    self._info_inflight_by_index[index] = request_id
             cached_formats = self._playlist_item_formats_cache.get(index)
             if cached_formats:
                 self._apply_formats(cached_formats)
@@ -1310,6 +1369,9 @@ class App(ctk.CTk):
             thumb_url = self._resolve_thumbnail_url(info)
             if thumb_url and self.preview_panel:
                 self.preview_panel.update_item_thumbnail(index, thumb_url)
+            cached_formats = self._playlist_item_formats_cache.get(index)
+            if cached_formats:
+                self._update_playlist_row_size(index, dict(info), cached_formats)
         if update_current:
             self._current_info = dict(info)
             self._update_info_display()
@@ -1424,8 +1486,14 @@ class App(ctk.CTk):
                 elif event == "item_info":
                     index = None
                     info = payload
+                    request_id = None
                     if isinstance(payload, tuple) and len(payload) == 3:
-                        _, index, info = payload
+                        request_id, index, info = payload
+                    if isinstance(index, int) and request_id is not None:
+                        inflight = self._info_inflight_by_index.get(index)
+                        if inflight is None or inflight != request_id:
+                            continue
+                        self._info_inflight_by_index.pop(index, None)
                     update_current = bool(
                         self._selected_playlist_item
                         and isinstance(index, int)
@@ -1572,6 +1640,10 @@ class App(ctk.CTk):
             on_clear_failed=self._on_queue_clear_failed,
             on_remove=self._on_queue_remove,
             on_retry=self._on_queue_retry,
+            on_bulk_remove=self._on_queue_remove_selected,
+            on_bulk_retry=self._on_queue_retry_selected,
+            on_bulk_move_top=self._on_queue_move_selected_top,
+            on_bulk_move_bottom=self._on_queue_move_selected_bottom,
             on_move_to_index=self._on_queue_move_to_index,
         )
         self._queue_page.pack(fill="both", expand=True)
