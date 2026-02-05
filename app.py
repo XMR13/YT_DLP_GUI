@@ -70,11 +70,12 @@ class App(ctk.CTk):
         self._current_task: Optional[str] = None
         self._solver_warning_shown = False
         self._auto_fetch_job: Optional[str] = None
-        self._item_info_job: Optional[str] = None
         self._expected_formats_request_id: Optional[int] = None
         self._expected_formats_index: Optional[int] = None
-        self._expected_item_info_request_id: Optional[int] = None
-        self._expected_item_info_index: Optional[int] = None
+        self._formats_request_index: Dict[int, Optional[int]] = {}
+        self._formats_pending_options: Dict[int, List[FormatOption]] = {}
+        self._formats_pending_info: Dict[int, Dict] = {}
+        self._formats_inflight_by_index: Dict[int, int] = {}
         self._warning_once: set[str] = set()
         self._wheel_remainders: Dict[object, float] = {}
         self._main_scroll_canvas: Optional[tk.Canvas] = None
@@ -461,7 +462,7 @@ class App(ctk.CTk):
 
         self._set_busy(True, task="fetch")
         self._expected_formats_index = None
-        self._expected_formats_request_id = self._controller.fetch_formats(
+        request_id = self._controller.fetch_formats(
             url=url,
             playlist_mode=False,
             playlist_items=None,
@@ -470,6 +471,8 @@ class App(ctk.CTk):
             js_runtime_path=self._normalize_runtime_path(),
             remote_components=self._normalize_remote_components(),
         )
+        self._expected_formats_request_id = request_id
+        self._formats_request_index[request_id] = None
 
     def _on_download_single(self) -> None:
         url = self.url_var.get().strip()
@@ -514,14 +517,18 @@ class App(ctk.CTk):
         self._selected_playlist_items = []
         self._playlist_item_info_cache.clear()
         self._playlist_item_formats_cache.clear()
-        self._expected_item_info_request_id = None
-        self._expected_item_info_index = None
-        if self._item_info_job:
+        self._expected_formats_request_id = None
+        self._expected_formats_index = None
+        self._formats_request_index.clear()
+        self._formats_pending_options.clear()
+        self._formats_pending_info.clear()
+        self._formats_inflight_by_index.clear()
+        if self._auto_fetch_job:
             try:
-                self.after_cancel(self._item_info_job)
+                self.after_cancel(self._auto_fetch_job)
             except Exception:
                 pass
-            self._item_info_job = None
+            self._auto_fetch_job = None
         self._set_playlist_selection_state(False, False)
         self.preview_panel.set_items([])
         self._preview_page_size = 20
@@ -544,30 +551,7 @@ class App(ctk.CTk):
         if not self._selected_playlist_item:
             messagebox.showwarning("No selection", "Please select a playlist item first.")
             return
-
-        url = self.playlist_url_var.get().strip()
-        if not url:
-            messagebox.showwarning("Missing URL", "Please enter a playlist URL first.")
-            return
-
-        cached_formats = self._playlist_item_formats_cache.get(self._selected_playlist_item.index)
-        if cached_formats:
-            self._expected_formats_request_id = None
-            self._expected_formats_index = None
-            self._apply_formats(cached_formats)
-            return
-
-        self._set_busy(True, task="fetch")
-        self._expected_formats_index = self._selected_playlist_item.index
-        self._expected_formats_request_id = self._controller.fetch_formats(
-            url=url,
-            playlist_mode=True,
-            playlist_items=str(self._selected_playlist_item.index),
-            cookies=self._normalize_cookies(),
-            js_runtime=self._normalize_js_runtime(),
-            js_runtime_path=self._normalize_runtime_path(),
-            remote_components=self._normalize_remote_components(),
-        )
+        self._start_playlist_item_fetch(self._selected_playlist_item.index, emit_busy=True)
 
     def _on_download_selected(self) -> None:
         if not self._selected_playlist_items:
@@ -761,7 +745,6 @@ class App(ctk.CTk):
         for label, key in (
             ("queued", "queued"),
             ("running", "running"),
-            ("done", "completed"),
             ("failed", "failed"),
             ("cancelled", "cancelled"),
         ):
@@ -887,6 +870,7 @@ class App(ctk.CTk):
 
     def _on_selection_change(self, *_args: object) -> None:
         self._update_info_display()
+        self._refresh_cached_playlist_row_sizes()
 
     def _on_playlist_selection_changed(
         self,
@@ -897,8 +881,6 @@ class App(ctk.CTk):
         self._selected_playlist_items = selected_items
         self._set_playlist_selection_state(bool(selected_items), active_item is not None)
         if active_item:
-            self._expected_item_info_request_id = None
-            self._expected_item_info_index = None
             index = active_item.index
             self._current_info = {"title": active_item.title, "duration": active_item.duration}
             cached_info = self._playlist_item_info_cache.get(index)
@@ -906,24 +888,21 @@ class App(ctk.CTk):
                 self._apply_playlist_item_info(index, cached_info, update_current=True)
             else:
                 self._update_info_display()
-                self._schedule_item_info_fetch(index)
             cached_formats = self._playlist_item_formats_cache.get(index)
             if cached_formats:
-                self._expected_formats_request_id = None
-                self._expected_formats_index = None
                 self._apply_formats(cached_formats)
+                if cached_info:
+                    self._update_playlist_row_size(index, cached_info, cached_formats)
             else:
-                self._schedule_auto_fetch_selected()
+                self._schedule_auto_fetch_selected(index)
         else:
             self._current_info = {}
-            self._expected_item_info_request_id = None
-            self._expected_item_info_index = None
-            if self._item_info_job:
+            if self._auto_fetch_job:
                 try:
-                    self.after_cancel(self._item_info_job)
+                    self.after_cancel(self._auto_fetch_job)
                 except Exception:
                     pass
-                self._item_info_job = None
+                self._auto_fetch_job = None
             self._update_info_display()
 
     def _on_load_more_preview(self) -> None:
@@ -956,6 +935,7 @@ class App(ctk.CTk):
         return ",".join(str(index) for index in indices)
 
     def _apply_formats(self, options: List[FormatOption]) -> None:
+        current_selection = self.resolution_var.get()
         self._format_options = list(options)
         self._format_map = {opt.label: opt for opt in self._format_options}
         values = [opt.label for opt in self._format_options]
@@ -964,8 +944,11 @@ class App(ctk.CTk):
         else:
             values = ["Best available"]
         self.options_panel.resolution_menu.configure(values=values)
-        self.resolution_var.set(values[0])
-        self._update_info_display()
+        selected_value = current_selection if current_selection in values else values[0]
+        if self.resolution_var.get() != selected_value:
+            self.resolution_var.set(selected_value)
+        else:
+            self._update_info_display()
 
     def _set_playlist_selection_state(self, has_selection: bool, has_active: bool) -> None:
         fetch_state = "normal" if has_active else "disabled"
@@ -1127,17 +1110,17 @@ class App(ctk.CTk):
         title = info.get("title") or "—"
         uploader = self._resolve_uploader(info)
         duration = self._format_duration(info.get("duration"))
-        duration_seconds = info.get("duration") if isinstance(info.get("duration"), (int, float)) else None
+        selected = self.resolution_var.get()
+        option = self._format_map.get(selected)
+        if selected == "Best available" and self._format_options:
+            option = self._format_options[0]
 
         if self.format_type_var.get() == "Audio only":
             resolution = "Audio only"
             fmt = "bestaudio"
-            size = "Unknown"
+            size_bytes = self._adapter.resolve_audio_only_size_bytes(info)
+            size = self._format_size(size_bytes)
         else:
-            selected = self.resolution_var.get()
-            option = self._format_map.get(selected)
-            if selected == "Best available" and self._format_options:
-                option = self._format_options[0]
             if option:
                 resolution = f"{option.height}p" if option.height else "Unknown"
                 if option.fps:
@@ -1147,9 +1130,7 @@ class App(ctk.CTk):
                         fps_text = option.fps
                     resolution = f"{resolution} @ {fps_text}fps"
                 fmt = option.ext or "Unknown"
-                size_bytes = option.filesize or option.filesize_approx
-                if not size_bytes and option.tbr and duration_seconds:
-                    size_bytes = self._estimate_filesize_bytes(option.tbr, duration_seconds)
+                size_bytes = self._adapter.resolve_download_size_bytes(info, option)
                 size = self._format_size(size_bytes)
             else:
                 resolution = "Best available"
@@ -1167,31 +1148,60 @@ class App(ctk.CTk):
             }
         )
         if self._selected_playlist_item:
-            self.preview_panel.update_selected_size(size)
+            self.preview_panel.update_item_size(self._selected_playlist_item.index, size)
 
-    def _schedule_auto_fetch_selected(self) -> None:
+    def _schedule_auto_fetch_selected(self, index: int) -> None:
         if self._auto_fetch_job:
             self.after_cancel(self._auto_fetch_job)
         self._auto_fetch_job = self.after(
-            self.PLAYLIST_AUTO_FETCH_DELAY_MS, self._auto_fetch_selected_formats
+            self.PLAYLIST_AUTO_FETCH_DELAY_MS,
+            lambda: self._auto_fetch_selected_formats(index),
         )
 
-    def _schedule_item_info_fetch(self, index: int) -> None:
-        if self._item_info_job:
-            self.after_cancel(self._item_info_job)
-        self._item_info_job = self.after(
-            self.PLAYLIST_AUTO_FETCH_DELAY_MS, lambda: self._fetch_selected_item_info(index)
-        )
-
-    def _fetch_selected_item_info(self, index: int) -> None:
-        self._item_info_job = None
-        url = self.playlist_url_var.get().strip()
-        if not url:
-            return
+    def _auto_fetch_selected_formats(self, index: int) -> None:
+        self._auto_fetch_job = None
         if not self._selected_playlist_item or self._selected_playlist_item.index != index:
             return
-        self._expected_item_info_index = index
-        self._expected_item_info_request_id = self._controller.fetch_item_info(
+        if index in self._playlist_item_formats_cache:
+            cached_formats = self._playlist_item_formats_cache[index]
+            self._apply_formats(cached_formats)
+            cached_info = self._playlist_item_info_cache.get(index)
+            if cached_info:
+                self._update_playlist_row_size(index, cached_info, cached_formats)
+            return
+        self._start_playlist_item_fetch(index, emit_busy=False)
+
+    def _start_playlist_item_fetch(self, index: int, *, emit_busy: bool) -> None:
+        cached_formats = self._playlist_item_formats_cache.get(index)
+        if cached_formats:
+            self._expected_formats_index = index
+            self._expected_formats_request_id = None
+            self._apply_formats(cached_formats)
+            cached_info = self._playlist_item_info_cache.get(index)
+            if cached_info:
+                self._update_playlist_row_size(index, cached_info, cached_formats)
+            return
+
+        url = self.playlist_url_var.get().strip()
+        if not url:
+            if emit_busy:
+                messagebox.showwarning("Missing URL", "Please enter a playlist URL first.")
+            return
+
+        inflight_request = self._formats_inflight_by_index.get(index)
+        if inflight_request is not None:
+            self._expected_formats_request_id = inflight_request
+            self._expected_formats_index = index
+            if self._selected_playlist_item and self._selected_playlist_item.index == index:
+                self.preview_panel.update_item_size(index, "loading...")
+            return
+
+        if emit_busy:
+            self._set_busy(True, task="fetch")
+        if self._selected_playlist_item and self._selected_playlist_item.index == index:
+            self.preview_panel.update_item_size(index, "loading...")
+
+        request_id = self._controller.fetch_formats(
             url=url,
             playlist_mode=True,
             playlist_items=str(index),
@@ -1199,33 +1209,12 @@ class App(ctk.CTk):
             js_runtime=self._normalize_js_runtime(),
             js_runtime_path=self._normalize_runtime_path(),
             remote_components=self._normalize_remote_components(),
-            index=index,
+            emit_busy=emit_busy,
         )
-
-    def _auto_fetch_selected_formats(self) -> None:
-        self._auto_fetch_job = None
-        if not self._selected_playlist_item:
-            return
-        url = self.playlist_url_var.get().strip()
-        if not url:
-            return
-        index = self._selected_playlist_item.index
-        if index in self._playlist_item_formats_cache:
-            self._expected_formats_request_id = None
-            self._expected_formats_index = None
-            self._apply_formats(self._playlist_item_formats_cache[index])
-            return
-        self.preview_panel.update_selected_size("loading...")
-        self._expected_formats_index = self._selected_playlist_item.index
-        self._expected_formats_request_id = self._controller.fetch_formats(
-            url=url,
-            playlist_mode=True,
-            playlist_items=str(self._selected_playlist_item.index),
-            cookies=self._normalize_cookies(),
-            js_runtime=self._normalize_js_runtime(),
-            js_runtime_path=self._normalize_runtime_path(),
-            remote_components=self._normalize_remote_components(),
-        )
+        self._expected_formats_index = index
+        self._expected_formats_request_id = request_id
+        self._formats_request_index[request_id] = index
+        self._formats_inflight_by_index[index] = request_id
 
     @staticmethod
     def _format_duration(value: Optional[object]) -> str:
@@ -1250,10 +1239,63 @@ class App(ctk.CTk):
             size /= 1024
         return f"{size:.1f} TB"
 
-    @staticmethod
-    def _estimate_filesize_bytes(tbr_kbps: float, duration_seconds: float) -> int:
-        bytes_per_second = (tbr_kbps * 1000) / 8
-        return int(bytes_per_second * float(duration_seconds))
+    def _refresh_cached_playlist_row_sizes(self) -> None:
+        if not self.preview_panel:
+            return
+        for index, options in self._playlist_item_formats_cache.items():
+            info = self._playlist_item_info_cache.get(index)
+            if info:
+                self._update_playlist_row_size(index, info, options)
+
+    def _update_playlist_row_size(self, index: int, info: Dict, options: List[FormatOption]) -> None:
+        if not self.preview_panel:
+            return
+        if self.format_type_var.get() == "Audio only":
+            size_bytes = self._adapter.resolve_audio_only_size_bytes(info)
+        else:
+            selected = self.resolution_var.get()
+            option = next((opt for opt in options if opt.label == selected), None)
+            if selected == "Best available" or option is None:
+                option = options[0] if options else None
+            size_bytes = self._adapter.resolve_download_size_bytes(info, option)
+        self.preview_panel.update_item_size(index, self._format_size(size_bytes))
+
+    def _resolve_formats_request(self, request_id: int) -> None:
+        options = self._formats_pending_options.get(request_id)
+        info = self._formats_pending_info.get(request_id)
+        if options is None or info is None:
+            return
+
+        self._formats_pending_options.pop(request_id, None)
+        self._formats_pending_info.pop(request_id, None)
+        index = self._formats_request_index.pop(request_id, None)
+
+        if isinstance(index, int):
+            current = self._formats_inflight_by_index.get(index)
+            if current == request_id:
+                self._formats_inflight_by_index.pop(index, None)
+            self._playlist_item_formats_cache[index] = list(options)
+            self._apply_playlist_item_info(index, dict(info), update_current=False)
+            self._update_playlist_row_size(index, dict(info), list(options))
+            if self._selected_playlist_item and self._selected_playlist_item.index == index:
+                self._expected_formats_index = index
+                self._expected_formats_request_id = request_id
+                self._apply_formats(list(options))
+                self._apply_playlist_item_info(index, dict(info), update_current=True)
+            return
+
+        if self._expected_formats_request_id is not None and request_id != self._expected_formats_request_id:
+            return
+        self._apply_formats(list(options))
+        self._apply_playlist_item_info(None, dict(info), update_current=True)
+
+    def _clear_formats_request(self, request_id: int) -> None:
+        self._formats_pending_options.pop(request_id, None)
+        self._formats_pending_info.pop(request_id, None)
+        index = self._formats_request_index.pop(request_id, None)
+        if isinstance(index, int) and self._formats_inflight_by_index.get(index) == request_id:
+            self._formats_inflight_by_index.pop(index, None)
+
 
     def _apply_playlist_item_info(self, index: Optional[int], info: Dict, update_current: bool) -> None:
         if index is not None:
@@ -1329,11 +1371,11 @@ class App(ctk.CTk):
                     options = payload
                     if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[0], int):
                         request_id, options = payload
-                    if request_id is not None and request_id != self._expected_formats_request_id:
-                        continue
-                    self._apply_formats(list(options))  # type: ignore[arg-type]
-                    if self._expected_formats_index is not None:
-                        self._playlist_item_formats_cache[self._expected_formats_index] = list(options)  # type: ignore[arg-type]
+                    if request_id is None:
+                        self._apply_formats(list(options))  # type: ignore[arg-type]
+                    else:
+                        self._formats_pending_options[request_id] = list(options)  # type: ignore[arg-type]
+                        self._resolve_formats_request(request_id)
                 elif event == "preview":
                     items = payload
                     total_count: Optional[int] = None
@@ -1358,14 +1400,14 @@ class App(ctk.CTk):
                     if not append:
                         self._selected_playlist_item = None
                         self._selected_playlist_items = []
-                        self._expected_item_info_request_id = None
-                        self._expected_item_info_index = None
-                        if self._item_info_job:
+                        self._expected_formats_request_id = None
+                        self._expected_formats_index = None
+                        if self._auto_fetch_job:
                             try:
-                                self.after_cancel(self._item_info_job)
+                                self.after_cancel(self._auto_fetch_job)
                             except Exception:
                                 pass
-                            self._item_info_job = None
+                            self._auto_fetch_job = None
                         self._set_playlist_selection_state(False, False)
                         self._current_info = {}
                         self._update_info_display()
@@ -1374,24 +1416,25 @@ class App(ctk.CTk):
                     info = payload
                     if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[0], int):
                         request_id, info = payload
-                    if request_id is not None and request_id != self._expected_formats_request_id:
-                        continue
-                    index = self._expected_formats_index
-                    self._apply_playlist_item_info(index, dict(info), update_current=True)  # type: ignore[arg-type]
+                    if request_id is None:
+                        self._apply_playlist_item_info(self._expected_formats_index, dict(info), update_current=True)  # type: ignore[arg-type]
+                    else:
+                        self._formats_pending_info[request_id] = dict(info)  # type: ignore[arg-type]
+                        self._resolve_formats_request(request_id)
                 elif event == "item_info":
-                    request_id = None
                     index = None
                     info = payload
-                    if isinstance(payload, tuple) and len(payload) == 3 and isinstance(payload[0], int):
-                        request_id, index, info = payload
-                    if request_id is not None and request_id != self._expected_item_info_request_id:
-                        continue
+                    if isinstance(payload, tuple) and len(payload) == 3:
+                        _, index, info = payload
                     update_current = bool(
                         self._selected_playlist_item
                         and isinstance(index, int)
                         and self._selected_playlist_item.index == index
                     )
                     self._apply_playlist_item_info(index, dict(info), update_current=update_current)  # type: ignore[arg-type]
+                elif event == "formats_error":
+                    if isinstance(payload, int):
+                        self._clear_formats_request(payload)
                 elif event == "log":
                     self._append_log(str(payload))
                 elif event == "progress":

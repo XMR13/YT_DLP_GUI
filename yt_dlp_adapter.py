@@ -188,6 +188,101 @@ class YtDlpAdapter:
         options.sort(key=lambda opt: (opt.height or 0, opt.fps or 0), reverse=True)
         return options
 
+    @staticmethod
+    def estimate_filesize_bytes(tbr_kbps: float, duration_seconds: float) -> int:
+        bytes_per_second = (tbr_kbps * 1000) / 8
+        return int(bytes_per_second * float(duration_seconds))
+
+    @staticmethod
+    def resolve_format_entry_size_bytes(
+        fmt: Optional[Dict],
+        duration_seconds: Optional[object],
+    ) -> Optional[int]:
+        if not isinstance(fmt, dict):
+            return None
+        size_bytes = fmt.get("filesize") or fmt.get("filesize_approx")
+        if isinstance(size_bytes, (int, float)) and size_bytes > 0:
+            return int(size_bytes)
+        tbr = fmt.get("tbr")
+        if isinstance(tbr, (int, float)) and tbr > 0 and isinstance(duration_seconds, (int, float)):
+            return YtDlpAdapter.estimate_filesize_bytes(float(tbr), float(duration_seconds))
+        return None
+
+    @staticmethod
+    def pick_best_audio_format(
+        formats: List[Dict],
+        exclude_format_id: Optional[str] = None,
+    ) -> Optional[Dict]:
+        best: Optional[Dict] = None
+        best_score: Optional[Tuple[int, float, float, float]] = None
+        for fmt in formats:
+            if not isinstance(fmt, dict):
+                continue
+            format_id = str(fmt.get("format_id") or "")
+            if exclude_format_id and format_id == exclude_format_id:
+                continue
+            acodec = str(fmt.get("acodec") or "none")
+            if acodec == "none":
+                continue
+            vcodec = str(fmt.get("vcodec") or "none")
+            score = (
+                1 if vcodec == "none" else 0,
+                float(fmt.get("abr") or 0),
+                float(fmt.get("tbr") or 0),
+                float(fmt.get("filesize") or fmt.get("filesize_approx") or 0),
+            )
+            if best_score is None or score > best_score:
+                best = fmt
+                best_score = score
+        return best
+
+    @staticmethod
+    def resolve_audio_only_size_bytes(info: Dict) -> Optional[int]:
+        formats = info.get("formats")
+        if not isinstance(formats, list):
+            return None
+        best_audio = YtDlpAdapter.pick_best_audio_format(formats)
+        return YtDlpAdapter.resolve_format_entry_size_bytes(best_audio, info.get("duration"))
+
+    @staticmethod
+    def resolve_download_size_bytes(info: Dict, option: Optional[FormatOption]) -> Optional[int]:
+        if not option:
+            return None
+        formats = info.get("formats")
+        duration = info.get("duration")
+        if not isinstance(formats, list):
+            size_bytes = option.filesize or option.filesize_approx
+            if not size_bytes and option.tbr and isinstance(duration, (int, float)):
+                return YtDlpAdapter.estimate_filesize_bytes(option.tbr, duration)
+            return size_bytes
+
+        selected = next(
+            (
+                fmt
+                for fmt in formats
+                if isinstance(fmt, dict) and str(fmt.get("format_id") or "") == option.format_id
+            ),
+            None,
+        )
+        selected_size = YtDlpAdapter.resolve_format_entry_size_bytes(selected, duration)
+        if not isinstance(selected, dict):
+            if selected_size:
+                return selected_size
+            size_bytes = option.filesize or option.filesize_approx
+            if not size_bytes and option.tbr and isinstance(duration, (int, float)):
+                return YtDlpAdapter.estimate_filesize_bytes(option.tbr, duration)
+            return size_bytes
+
+        has_audio = str(selected.get("acodec") or "none") != "none"
+        if has_audio:
+            return selected_size
+
+        best_audio = YtDlpAdapter.pick_best_audio_format(formats, exclude_format_id=option.format_id)
+        audio_size = YtDlpAdapter.resolve_format_entry_size_bytes(best_audio, duration)
+        if selected_size and audio_size:
+            return selected_size + audio_size
+        return selected_size or audio_size
+
     def download(
         self,
         url: str,

@@ -45,11 +45,14 @@ class QueueRunner:
 
     def load(self) -> List[QueueItem]:
         # If the app crashed with a running item, reset it to queued.
+        # Completed items are history-only and are auto-cleared from queue view.
         original = self._store.load()
         items: List[QueueItem] = []
         for item in original:
             if item.status == "running":
                 items.append(replace(item, status="queued", updated_at=_now_iso()))
+            elif item.status == "completed":
+                continue
             else:
                 items.append(item)
         if items != original:
@@ -217,7 +220,7 @@ class QueueRunner:
         item = self._next_queued_item()
         if not item:
             return False
-        self._run_one(item)
+        self._run_one(item, auto_clear_completed=False)
         return True
 
     def _run_loop(self) -> None:
@@ -237,7 +240,7 @@ class QueueRunner:
                 self._wake.clear()
                 continue
 
-            self._run_one(item)
+            self._run_one(item, auto_clear_completed=True)
 
     def _next_queued_item(self) -> Optional[QueueItem]:
         items = self._store.load()
@@ -246,7 +249,7 @@ class QueueRunner:
                 return item
         return None
 
-    def _run_one(self, item: QueueItem) -> None:
+    def _run_one(self, item: QueueItem, *, auto_clear_completed: bool) -> None:
         running = replace(item, status="running", updated_at=_now_iso())
         with self._lock:
             self._active_id = running.id
@@ -283,9 +286,23 @@ class QueueRunner:
                 self._active_id = None
                 self._active_output_dir = None
             self._emit_busy(False, None)
-            self._emit_queue_updated(self._store.load())
+            items = self._store.load()
+            if auto_clear_completed:
+                items = self._cleanup_completed_if_idle(items)
+            self._emit_queue_updated(items)
             # If stop was requested while running, we won't pick up the next item.
             self._wake.set()
+
+    def _cleanup_completed_if_idle(self, items: List[QueueItem]) -> List[QueueItem]:
+        has_pending = any(item.status in ("queued", "running") for item in items)
+        if has_pending:
+            return items
+        filtered = [item for item in items if item.status != "completed"]
+        if len(filtered) == len(items):
+            return items
+        self._store.save(filtered)
+        self._emit_log("Queue: auto-cleared completed items.")
+        return filtered
 
     def _emit(self, event: str, payload: object) -> None:
         if self._events is None:

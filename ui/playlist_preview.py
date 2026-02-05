@@ -85,6 +85,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._load_more_button.pack(pady=(0, 12))
 
         self._image_cache: Dict[str, ImageTk.PhotoImage] = {}
+        self._thumb_loading: Set[str] = set()
         self._placeholder = self._build_placeholder()
         self._on_select = on_select
         self._on_load_more = on_load_more
@@ -126,6 +127,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._row_uploader.clear()
         self._thumb_override.clear()
         self._image_cache.clear()
+        self._thumb_loading.clear()
         self._total_count = total_count if isinstance(total_count, int) and total_count > 0 else len(items)
         self._update_selected_count()
 
@@ -372,6 +374,9 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
             except tk.TclError:
                 pass
             return
+        if url in self._thumb_loading:
+            return
+        self._thumb_loading.add(url)
 
         def worker() -> None:
             try:
@@ -382,7 +387,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
                 image.thumbnail((120, 68), Image.LANCZOS)
                 self.after(0, lambda: self._apply_thumbnail(row, image, url))
             except Exception:
-                pass
+                self.after(0, lambda: self._thumb_loading.discard(url))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -398,12 +403,19 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
             row.thumb.image = photo
         except tk.TclError:
             pass
+        finally:
+            self._thumb_loading.discard(url)
 
     def update_selected_size(self, size_text: str) -> None:
         if self._active_index is None:
             return
-        self._row_size[self._active_index] = size_text
-        self._render_row_meta(self._active_index)
+        self.update_item_size(self._active_index, size_text)
+
+    def update_item_size(self, index: int, size_text: str) -> None:
+        if index not in self._row_duration:
+            return
+        self._row_size[index] = size_text
+        self._render_row_meta(index)
 
     def update_item_duration(self, index: int, duration_seconds: Optional[int]) -> None:
         if index not in self._row_duration:

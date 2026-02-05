@@ -30,11 +30,13 @@ class DownloadController:
         js_runtime: Optional[str] = None,
         js_runtime_path: Optional[str] = None,
         remote_components: Optional[str] = None,
+        emit_busy: bool = True,
     ) -> int:
         with self._formats_lock:
             self._formats_request_id += 1
             request_id = self._formats_request_id
-        self._events.put(("busy", (True, "fetch")))
+        if emit_busy:
+            self._events.put(("busy", (True, "fetch")))
         threading.Thread(
             target=self._fetch_formats_worker,
             args=(
@@ -46,6 +48,7 @@ class DownloadController:
                 js_runtime,
                 js_runtime_path,
                 remote_components,
+                emit_busy,
             ),
             daemon=True,
         ).start()
@@ -147,6 +150,7 @@ class DownloadController:
         js_runtime: Optional[str],
         js_runtime_path: Optional[str],
         remote_components: Optional[str],
+        emit_busy: bool,
     ) -> None:
         try:
             info = self._adapter.fetch_info(
@@ -164,9 +168,11 @@ class DownloadController:
             title = info.get("title") or "Selection loaded."
             self._events.put(("log", f"Formats loaded for: {title}"))
         except Exception as exc:  # noqa: BLE001 - UI surface for any failures.
+            self._events.put(("formats_error", request_id))
             self._events.put(("error", str(exc)))
         finally:
-            self._events.put(("busy", (False, None)))
+            if emit_busy:
+                self._events.put(("busy", (False, None)))
 
     def _fetch_item_info_worker(
         self,
