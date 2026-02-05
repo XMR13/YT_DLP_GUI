@@ -38,6 +38,8 @@ class PlaylistItem:
 
 class YtDlpAdapter:
     FILE_PRINT_PREFIX = "__FILE__:"
+    ALLOWED_JS_RUNTIMES = {"node", "deno", "bun", "quickjs"}
+    ALLOWED_REMOTE_COMPONENTS = {"ejs:github", "ejs:npm"}
 
     def __init__(
         self,
@@ -72,7 +74,7 @@ class YtDlpAdapter:
         js_runtime_path: Optional[str] = None,
         remote_components: Optional[str] = None,
     ) -> Dict:
-        args = ["yt-dlp", "-J", url]
+        args = ["yt-dlp", "-J"]
         if playlist_mode:
             items = playlist_items or "1"
             args.extend(["--playlist-items", items])
@@ -82,6 +84,7 @@ class YtDlpAdapter:
         if cookies_from_browser:
             args.extend(["--cookies-from-browser", cookies_from_browser])
         self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
+        self._append_url_arg(args, url)
 
         self._log("Fetching info...")
         info = self._run_json_with_retry(args, retry_android=True)
@@ -110,12 +113,12 @@ class YtDlpAdapter:
             "--flat-playlist",
             "--playlist-items",
             items_arg,
-            url,
         ]
 
         if cookies_from_browser:
             args.extend(["--cookies-from-browser", cookies_from_browser])
         self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
+        self._append_url_arg(args, url)
 
         self._log("Fetching playlist preview...")
         info = self._run_json_with_retry(args, retry_android=True)
@@ -316,7 +319,6 @@ class YtDlpAdapter:
             "--progress",
             "--print",
             f"after_move:{self.FILE_PRINT_PREFIX}%(filepath)s",
-            url,
         ]
 
         if playlist_mode:
@@ -329,6 +331,7 @@ class YtDlpAdapter:
         if cookies_from_browser:
             args.extend(["--cookies-from-browser", cookies_from_browser])
         self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
+        self._append_url_arg(args, url)
 
         self._log("Starting download...")
         output_paths: List[str] = []
@@ -499,17 +502,45 @@ class YtDlpAdapter:
         js_runtime_path: Optional[str],
         remote_components: Optional[str],
     ) -> None:
-        # Ensure js runtime and remote-components flags are appended at most once.
+        runtime = (js_runtime or "").strip()
+        runtime_path = (js_runtime_path or "").strip()
+        components = (remote_components or "").strip()
+
+        if runtime and runtime not in YtDlpAdapter.ALLOWED_JS_RUNTIMES:
+            raise ValueError(f"Unsupported JS runtime: {runtime}")
+
+        if runtime_path and not runtime:
+            raise ValueError("Runtime path requires a JS runtime selection.")
+
         runtime_arg: Optional[str] = None
-        if js_runtime:
-            runtime_arg = f"{js_runtime}:{js_runtime_path}" if js_runtime_path else js_runtime
-        elif js_runtime_path:
-            runtime_arg = js_runtime_path
+        if runtime:
+            if runtime_path:
+                resolved_path = Path(runtime_path).expanduser()
+                if not resolved_path.is_file():
+                    raise ValueError(f"Runtime path not found: {runtime_path}")
+                runtime_arg = f"{runtime}:{resolved_path}"
+            else:
+                runtime_arg = runtime
 
         if runtime_arg:
             args.extend(["--js-runtimes", runtime_arg])
-            if remote_components:
-                args.extend(["--remote-components", remote_components])
+            if components:
+                if components not in YtDlpAdapter.ALLOWED_REMOTE_COMPONENTS:
+                    raise ValueError(f"Unsupported remote components source: {components}")
+                args.extend(["--remote-components", components])
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        value = url.strip()
+        if not value:
+            raise ValueError("URL is required.")
+        if value.startswith("-"):
+            raise ValueError("Invalid URL: value cannot start with '-'.")
+        return value
+
+    @staticmethod
+    def _append_url_arg(args: List[str], url: str) -> None:
+        args.extend(["--", YtDlpAdapter._normalize_url(url)])
 
     def _run_json_with_retry(self, args: List[str], *, retry_android: bool) -> Dict:
         result = self._run_json_command(args, retry_android=retry_android)

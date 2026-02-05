@@ -105,7 +105,7 @@ class App(ctk.CTk):
         self.cookies_var = ctk.StringVar(value="None")
         self.js_runtime_var = ctk.StringVar(value="Auto")
         self.js_runtime_path_var = ctk.StringVar(value="")
-        self.remote_components_var = ctk.StringVar(value="ejs:github")
+        self.remote_components_var = ctk.StringVar(value="None")
         self._selected_playlist_item: Optional[PlaylistItem] = None
         self._selected_playlist_items: List[PlaylistItem] = []
         self._playlist_item_info_cache: Dict[int, Dict] = {}
@@ -1588,12 +1588,16 @@ class App(ctk.CTk):
     @staticmethod
     def _open_path(path: str) -> None:
         try:
+            candidate = Path(path).expanduser()
+            if not candidate.is_dir():
+                return
+            safe_path = str(candidate)
             if sys.platform.startswith("win"):
-                os.startfile(path)
+                os.startfile(safe_path)
             elif sys.platform == "darwin":
-                subprocess.run(["open", path], check=False)
+                subprocess.run(["open", safe_path], check=False)
             else:
-                subprocess.run(["xdg-open", path], check=False)
+                subprocess.run(["xdg-open", safe_path], check=False)
         except Exception:
             return
 

@@ -79,6 +79,15 @@ class HistoryStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = [entry.to_dict() for entry in entries[: self._max_entries]]
         self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if os.name == "posix":
+            try:
+                os.chmod(self._path.parent, 0o700)
+            except OSError:
+                pass
+            try:
+                os.chmod(self._path, 0o600)
+            except OSError:
+                pass
 
     def append(self, entry: HistoryEntry) -> List[HistoryEntry]:
         entries = self.load()

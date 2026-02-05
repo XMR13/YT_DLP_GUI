@@ -9,4 +9,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+#singular files
 AGENTS.md
+CHECKPOINT.md

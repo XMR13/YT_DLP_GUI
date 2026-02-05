@@ -129,6 +129,33 @@ def test_queue_runner_failure_marks_failed_and_retry(tmp_path, monkeypatch) -> N
     assert loaded[0].status == "completed"
 
 
+def test_queue_runner_rejects_invalid_queued_url(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    store = QueueStore(app_name="yt-dlp-gui-test")
+    runner = QueueRunner(store, FakeExecutor(["ok"]))
+
+    item = QueueItem.create(
+        url="https://example.com/1",
+        output_dir=str(tmp_path / "out"),
+        format_id=None,
+        audio_only=True,
+        playlist_mode=False,
+        playlist_items=None,
+        cookies=None,
+        js_runtime=None,
+        js_runtime_path=None,
+        remote_components=None,
+    )
+    tampered = replace(item, url="--exec echo pwned")
+    runner.enqueue(tampered, dedupe=False)
+
+    assert runner.run_next_blocking() is True
+    loaded = store.load()
+    assert loaded[0].status == "failed"
+    assert loaded[0].error == "Queue item URL is invalid."
+
+
 def test_queue_runner_move_queued_only(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     monkeypatch.setenv("APPDATA", str(tmp_path))

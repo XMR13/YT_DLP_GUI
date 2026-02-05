@@ -250,6 +250,17 @@ class QueueRunner:
         return None
 
     def _run_one(self, item: QueueItem, *, auto_clear_completed: bool) -> None:
+        validation_error = self._validate_item(item)
+        if validation_error:
+            failed = replace(item, status="failed", error=validation_error, updated_at=_now_iso())
+            self._store.replace(failed)
+            self._emit_log(f"Queue: failed validation: {validation_error}")
+            self._emit_error(validation_error)
+            self._emit("download_error", {"item": failed.to_dict(), "error": validation_error})
+            items = self._store.load()
+            self._emit_queue_updated(items)
+            return
+
         running = replace(item, status="running", updated_at=_now_iso())
         with self._lock:
             self._active_id = running.id
@@ -292,6 +303,20 @@ class QueueRunner:
             self._emit_queue_updated(items)
             # If stop was requested while running, we won't pick up the next item.
             self._wake.set()
+    
+    #validation for arguments, this prevent argument injection
+    @staticmethod
+    def _validate_item(item: QueueItem) -> Optional[str]:
+        url = (item.url or "").strip()
+
+        if not url:
+            return "Queue item URL is required"
+        if url.startswith("-"):
+            return "Queue item URL is invalid"
+        output_dir = (item.output_dir or "").strip()
+        if not output_dir:
+            return "Queue item output folder is reuqired"
+        return None
 
     def _cleanup_completed_if_idle(self, items: List[QueueItem]) -> List[QueueItem]:
         has_pending = any(item.status in ("queued", "running") for item in items)

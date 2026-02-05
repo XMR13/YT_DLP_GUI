@@ -100,3 +100,34 @@ def test_queue_store_truncates(tmp_path, monkeypatch) -> None:
     loaded = store.load()
     assert len(loaded) == 2
     assert loaded[0].url == "https://example.com/0"
+
+
+def test_queue_store_sanitizes_untrusted_runtime_fields(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    store = QueueStore(app_name="yt-dlp-gui-test", max_entries=50)
+
+    path = tmp_path / "yt-dlp-gui-test" / "queue.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "url": "https://example.com",
+                    "output_dir": "X",
+                    "cookies": "safari",
+                    "js_runtime": "pwsh",
+                    "js_runtime_path": "/tmp/evil",
+                    "remote_components": "ejs:evil",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = store.load()
+    assert len(loaded) == 1
+    assert loaded[0].cookies is None
+    assert loaded[0].js_runtime is None
+    assert loaded[0].js_runtime_path is None
+    assert loaded[0].remote_components is None

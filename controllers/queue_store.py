@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
 
+ALLOWED_COOKIE_BROWSERS = {"chrome", "edge", "firefox"}
+ALLOWED_JS_RUNTIMES = {"node", "deno", "bun", "quickjs"}
+ALLOWED_REMOTE_COMPONENTS = {"ejs:github", "ejs:npm"}
+
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -20,6 +24,16 @@ def _none_if_blank(value: Optional[str]) -> Optional[str]:
         return None
     value = value.strip()
     return value or None
+
+
+def _normalize_choice(value: Optional[str], allowed: set[str]) -> Optional[str]:
+    normalized = _none_if_blank(value)
+    if normalized is None:
+        return None
+    lowered = normalized.lower()
+    if lowered not in allowed:
+        return None
+    return lowered
 
 
 def _normalize_playlist_items(value: Optional[str]) -> Optional[str]:
@@ -99,14 +113,16 @@ class QueueItem:
             audio_only=bool(audio_only),
             playlist_mode=bool(playlist_mode),
             playlist_items=playlist_items_norm,
-            cookies=_none_if_blank(cookies),
-            js_runtime=_none_if_blank(js_runtime),
+            cookies=_normalize_choice(cookies, ALLOWED_COOKIE_BROWSERS),
+            js_runtime=_normalize_choice(js_runtime, ALLOWED_JS_RUNTIMES),
             js_runtime_path=_none_if_blank(js_runtime_path),
-            remote_components=_none_if_blank(remote_components),
+            remote_components=_normalize_choice(remote_components, ALLOWED_REMOTE_COMPONENTS),
             title=_none_if_blank(title),
             signature=None,
             updated_at=None,
         )
+        if item.js_runtime is None:
+            item = QueueItem(**{**asdict(item), "js_runtime_path": None, "remote_components": None})
         return item.with_signature()
 
     def with_signature(self) -> "QueueItem":
@@ -141,16 +157,18 @@ class QueueItem:
             audio_only=bool(raw.get("audio_only") or False),
             playlist_mode=bool(raw.get("playlist_mode") or False),
             playlist_items=playlist_items,
-            cookies=_none_if_blank(raw.get("cookies")),
-            js_runtime=_none_if_blank(raw.get("js_runtime")),
+            cookies=_normalize_choice(raw.get("cookies"), ALLOWED_COOKIE_BROWSERS),
+            js_runtime=_normalize_choice(raw.get("js_runtime"), ALLOWED_JS_RUNTIMES),
             js_runtime_path=_none_if_blank(raw.get("js_runtime_path")),
-            remote_components=_none_if_blank(raw.get("remote_components")),
+            remote_components=_normalize_choice(raw.get("remote_components"), ALLOWED_REMOTE_COMPONENTS),
             title=_none_if_blank(raw.get("title")),
             output_paths=[str(path) for path in output_paths if path],
             error=_none_if_blank(raw.get("error")),
             signature=_none_if_blank(raw.get("signature")),
             updated_at=_none_if_blank(raw.get("updated_at")),
         )
+        if item.js_runtime is None:
+            item = QueueItem(**{**asdict(item), "js_runtime_path": None, "remote_components": None})
         return item.with_signature() if not item.signature else item
 
 
@@ -175,6 +193,15 @@ class QueueStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = [item.to_dict() for item in items[: self._max_entries]]
         self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if os.name == "posix":
+            try:
+                os.chmod(self._path.parent, 0o700)
+            except OSError:
+                pass
+            try:
+                os.chmod(self._path, 0o600)
+            except OSError:
+                pass
 
     def append(self, item: QueueItem, *, dedupe: bool = True) -> List[QueueItem]:
         items = self.load()

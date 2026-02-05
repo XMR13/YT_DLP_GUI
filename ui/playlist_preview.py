@@ -5,6 +5,7 @@ from io import BytesIO
 import threading
 from typing import Callable, Dict, List, Optional, Set
 import tkinter as tk
+from urllib.parse import urlparse
 
 import customtkinter as ctk
 from PIL import Image, ImageTk
@@ -28,6 +29,7 @@ class _RowWidget:
 class PlaylistPreviewPanel(ctk.CTkFrame):
     ROW_HEIGHT = 86
     ROW_PADDING_Y = 6
+    MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
 
     def __init__(
         self,
@@ -380,8 +382,18 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
 
         def worker() -> None:
             try:
+                if not self._is_safe_thumbnail_url(url):
+                    self.after(0, lambda: self._thumb_loading.discard(url))
+                    return
                 with urlopen(url, timeout=5) as response:
-                    data = response.read()
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and int(content_length) > self.MAX_THUMBNAIL_BYTES:
+                        self.after(0, lambda: self._thumb_loading.discard(url))
+                        return
+                    data = response.read(self.MAX_THUMBNAIL_BYTES + 1)
+                    if len(data) > self.MAX_THUMBNAIL_BYTES:
+                        self.after(0, lambda: self._thumb_loading.discard(url))
+                        return
                 image = Image.open(BytesIO(data))
                 image = image.convert("RGB")
                 image.thumbnail((120, 68), Image.LANCZOS)
@@ -465,6 +477,11 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
             parts.append(f"Channel: {uploader}")
         parts.append(f"Size: {size_text}")
         return "  •  ".join(parts)
+
+    @staticmethod
+    def _is_safe_thumbnail_url(url: str) -> bool:
+        parsed = urlparse(url.strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
     @staticmethod
     def _format_duration(value: Optional[int]) -> str:
