@@ -31,10 +31,6 @@ class _QueueRowWidget:
     url: ctk.CTkLabel
     output: ctk.CTkLabel
     actions: ctk.CTkFrame
-    btn_top: ctk.CTkButton
-    btn_up: ctk.CTkButton
-    btn_down: ctk.CTkButton
-    btn_bottom: ctk.CTkButton
     btn_retry: ctk.CTkButton
     btn_remove: ctk.CTkButton
     bound_index: Optional[int] = None
@@ -58,10 +54,6 @@ class QueuePage(ctk.CTkFrame):
         on_clear_failed: Optional[Callable[[], None]] = None,
         on_remove: Optional[QueueAction] = None,
         on_retry: Optional[QueueAction] = None,
-        on_move_top: Optional[QueueAction] = None,
-        on_move_up: Optional[QueueAction] = None,
-        on_move_down: Optional[QueueAction] = None,
-        on_move_bottom: Optional[QueueAction] = None,
         on_move_to_index: Optional[QueueMoveAction] = None,
         **kwargs: object,
     ) -> None:
@@ -74,10 +66,6 @@ class QueuePage(ctk.CTkFrame):
         self._on_clear_failed = on_clear_failed
         self._on_remove = on_remove
         self._on_retry = on_retry
-        self._on_move_top = on_move_top
-        self._on_move_up = on_move_up
-        self._on_move_down = on_move_down
-        self._on_move_bottom = on_move_bottom
         self._on_move_to_index = on_move_to_index
 
         self._badge_colors = {
@@ -86,6 +74,13 @@ class QueuePage(ctk.CTkFrame):
             "completed": ("#2E7D32", "#2E7D32"),
             "cancelled": ("#3A3A3A", "#3A3A3A"),
             "failed": ("#B71C1C", "#B71C1C"),
+        }
+        self._badge_labels = {
+            "queued": "Queued",
+            "running": "Running",
+            "completed": "Done",
+            "cancelled": "Canceled",
+            "failed": "Failed",
         }
         self._items: List[dict] = []
         self._queued_positions: List[int] = []
@@ -173,6 +168,12 @@ class QueuePage(ctk.CTkFrame):
         )
         self._clear_failed_btn.pack(side="left", padx=4)
 
+        self.progress = ctk.CTkProgressBar(self, height=8)
+        self.progress.pack(fill="x", padx=12, pady=(0, 6))
+        self.progress.set(0)
+        self.progress_label = ctk.CTkLabel(self, text="Idle")
+        self.progress_label.pack(anchor="w", padx=12, pady=(0, 8))
+
         self._list_container = ctk.CTkFrame(self, corner_radius=8)
         self._list_container.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self._list_container.grid_rowconfigure(0, weight=1)
@@ -180,6 +181,9 @@ class QueuePage(ctk.CTkFrame):
 
         self._list_canvas = tk.Canvas(self._list_container, highlightthickness=0, bd=0)
         self._list_canvas.grid(row=0, column=0, sticky="nsew")
+        self._list_canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self._list_canvas.bind("<B1-Motion>", self._on_canvas_motion)
+        self._list_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
         self._list_scrollbar = ctk.CTkScrollbar(
             self._list_container,
@@ -200,7 +204,29 @@ class QueuePage(ctk.CTkFrame):
     def set_items(self, items: List[dict]) -> None:
         self._items = list(items)
         total = len(self._items)
-        self._count.configure(text=f"{total} item" + ("s" if total != 1 else ""))
+        counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0}
+        for item in self._items:
+            status = str(item.get("status") or "queued").lower()
+            if status in counts:
+                counts[status] += 1
+        parts: List[str] = []
+        for label, key in (
+            ("queued", "queued"),
+            ("running", "running"),
+            ("done", "completed"),
+            ("failed", "failed"),
+            ("cancelled", "cancelled"),
+        ):
+            count = counts[key]
+            if count:
+                parts.append(f"{count} {label}")
+        if total == 0:
+            text = "0 items"
+        else:
+            text = f"{total} item" + ("s" if total != 1 else "")
+            if parts:
+                text = f"{text} • " + " • ".join(parts)
+        self._count.configure(text=text)
 
         self._queued_positions = [
             idx
@@ -295,10 +321,6 @@ class QueuePage(ctk.CTkFrame):
         actions = ctk.CTkFrame(row, fg_color="transparent")
         actions.grid(row=0, column=1, rowspan=4, sticky="e", padx=12, pady=10)
 
-        btn_top = ctk.CTkButton(actions, text="Top", width=60)
-        btn_up = ctk.CTkButton(actions, text="Up", width=60)
-        btn_down = ctk.CTkButton(actions, text="Down", width=60)
-        btn_bottom = ctk.CTkButton(actions, text="Bottom", width=60)
         btn_retry = ctk.CTkButton(actions, text="Retry", width=80)
         btn_remove = ctk.CTkButton(actions, text="Remove", width=80)
 
@@ -311,10 +333,6 @@ class QueuePage(ctk.CTkFrame):
             url=url,
             output=output,
             actions=actions,
-            btn_top=btn_top,
-            btn_up=btn_up,
-            btn_down=btn_down,
-            btn_bottom=btn_bottom,
             btn_retry=btn_retry,
             btn_remove=btn_remove,
         )
@@ -333,6 +351,38 @@ class QueuePage(ctk.CTkFrame):
                 widget.configure(cursor="hand2")
             except Exception:
                 pass
+
+    def _on_canvas_press(self, event: tk.Event) -> None:
+        if not self._on_move_to_index:
+            return
+        index = int(self._list_canvas.canvasy(event.y) // self.ROW_HEIGHT)
+        if index < 0 or index >= len(self._items):
+            return
+        item = self._items[index]
+        if str(item.get("status") or "queued").lower() != "queued":
+            return
+        if len(self._queued_positions) <= 1:
+            return
+        item_id = str(item.get("id") or "")
+        if not item_id:
+            return
+        source_queued_index = self._queued_lookup.get(index)
+        if source_queued_index is None:
+            return
+        self._drag_candidate = _DragCandidate(
+            item_id=item_id,
+            start_x=event.x_root,
+            start_y=event.y_root,
+            source_index=index,
+            source_queued_index=source_queued_index,
+        )
+        self._drag_pointer_y_widget = self._event_y_widget(event)
+
+    def _on_canvas_motion(self, event: tk.Event) -> None:
+        self._on_row_motion(event, None)  # type: ignore[arg-type]
+
+    def _on_canvas_release(self, event: tk.Event) -> None:
+        self._on_row_release(event, None)  # type: ignore[arg-type]
 
     def _on_row_press(self, event: tk.Event, row: _QueueRowWidget) -> None:
         if not self._on_move_to_index:
@@ -621,7 +671,7 @@ class QueuePage(ctk.CTkFrame):
         row.title.configure(text=title)
 
         status = str(item.get("status") or "queued").lower()
-        badge_label = status.title()
+        badge_label = self._badge_labels.get(status, status.title())
         color = self._badge_colors.get(status, ("#555555", "#555555"))
         row.badge.configure(fg_color=color)
         row.badge_text.configure(text=badge_label)
@@ -629,21 +679,12 @@ class QueuePage(ctk.CTkFrame):
         row.url.configure(text=str(item.get("url") or ""))
         row.output.configure(text=self._format_output(item))
 
-        queued_index = self._queued_lookup.get(index)
-        can_move_top = queued_index is not None and queued_index > 0
-        can_move_up = can_move_top
-        can_move_down = queued_index is not None and queued_index < len(self._queued_positions) - 1
-        can_move_bottom = can_move_down
         item_id = str(item.get("id") or "")
 
         self._sync_actions(
             row,
             status,
             item_id,
-            can_move_top=can_move_top,
-            can_move_up=can_move_up,
-            can_move_down=can_move_down,
-            can_move_bottom=can_move_bottom,
         )
 
     def _sync_actions(
@@ -651,11 +692,6 @@ class QueuePage(ctk.CTkFrame):
         row: _QueueRowWidget,
         status: str,
         item_id: str,
-        *,
-        can_move_top: bool,
-        can_move_up: bool,
-        can_move_down: bool,
-        can_move_bottom: bool,
     ) -> None:
         def show(btn: ctk.CTkButton, enabled: bool = True) -> None:
             btn.configure(state="normal" if enabled else "disabled")
@@ -665,36 +701,6 @@ class QueuePage(ctk.CTkFrame):
         def hide(btn: ctk.CTkButton) -> None:
             if btn.winfo_ismapped():
                 btn.pack_forget()
-
-        if status == "queued":
-            if self._on_move_top:
-                row.btn_top.configure(command=lambda i=item_id: self._on_move_top(i))
-                show(row.btn_top, can_move_top)
-            else:
-                hide(row.btn_top)
-
-            if self._on_move_up:
-                row.btn_up.configure(command=lambda i=item_id: self._on_move_up(i))
-                show(row.btn_up, can_move_up)
-            else:
-                hide(row.btn_up)
-
-            if self._on_move_down:
-                row.btn_down.configure(command=lambda i=item_id: self._on_move_down(i))
-                show(row.btn_down, can_move_down)
-            else:
-                hide(row.btn_down)
-
-            if self._on_move_bottom:
-                row.btn_bottom.configure(command=lambda i=item_id: self._on_move_bottom(i))
-                show(row.btn_bottom, can_move_bottom)
-            else:
-                hide(row.btn_bottom)
-        else:
-            hide(row.btn_top)
-            hide(row.btn_up)
-            hide(row.btn_down)
-            hide(row.btn_bottom)
 
         if self._on_retry and status in ("failed", "cancelled"):
             row.btn_retry.configure(command=lambda i=item_id: self._on_retry(i))

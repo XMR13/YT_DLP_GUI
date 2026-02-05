@@ -38,6 +38,11 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
     ) -> None:
         super().__init__(master, corner_radius=12, **kwargs)
 
+        self._row_color = ("#E9E9E9", "#2B2B2B")
+        self._selected_color = ("#D6D6D6", "#3A3A3A")
+        self._hover_color = ("#E1E1E1", "#343434")
+        self._selected_hover_color = ("#CFCFCF", "#464646")
+
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(12, 6))
         header.grid_columnconfigure(0, weight=1)
@@ -54,7 +59,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         )
         self._count_label.grid(row=0, column=1, sticky="e")
 
-        self._list_container = ctk.CTkFrame(self, corner_radius=8)
+        self._list_container = ctk.CTkFrame(self, corner_radius=8, fg_color=self._get_row_bg())
         self._list_container.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self._list_container.grid_rowconfigure(0, weight=1)
         self._list_container.grid_columnconfigure(0, weight=1)
@@ -91,12 +96,9 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._selection_order: List[int] = []
         self._hovered_indices: Set[int] = set()
         self._active_index: Optional[int] = None
-        self._row_color = ("#E9E9E9", "#2B2B2B")
-        self._selected_color = ("#D6D6D6", "#3A3A3A")
-        self._hover_color = ("#E1E1E1", "#343434")
-        self._selected_hover_color = ("#CFCFCF", "#464646")
         self._row_duration: Dict[int, str] = {}
         self._row_size: Dict[int, str] = {}
+        self._row_uploader: Dict[int, str] = {}
         self._thumb_override: Dict[int, str] = {}
         self._total_count = 0
         self._empty_label: Optional[ctk.CTkLabel] = None
@@ -121,6 +123,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._active_index = None
         self._row_duration.clear()
         self._row_size.clear()
+        self._row_uploader.clear()
         self._thumb_override.clear()
         self._image_cache.clear()
         self._total_count = total_count if isinstance(total_count, int) and total_count > 0 else len(items)
@@ -408,6 +411,15 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         self._row_duration[index] = self._format_duration(duration_seconds)
         self._render_row_meta(index)
 
+    def update_item_uploader(self, index: int, uploader: Optional[str]) -> None:
+        if index not in self._row_duration:
+            return
+        if uploader:
+            self._row_uploader[index] = uploader
+        else:
+            self._row_uploader.pop(index, None)
+        self._render_row_meta(index)
+
     def update_item_thumbnail(self, index: int, thumbnail_url: Optional[str]) -> None:
         if thumbnail_url:
             self._thumb_override[index] = thumbnail_url
@@ -430,7 +442,17 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
             return
         duration = self._row_duration.get(index, "—")
         size_text = self._row_size.get(index, "fetch formats")
-        row.meta.configure(text=f"Duration: {duration}  •  Size: {size_text}")
+        row.meta.configure(text=self._build_meta_text(index, duration, size_text))
+
+    def _build_meta_text(self, index: int, duration: str, size_text: str) -> str:
+        parts = [f"Duration: {duration}"]
+        uploader = self._row_uploader.get(index)
+        if uploader:
+            if len(uploader) > 28:
+                uploader = uploader[:25] + "..."
+            parts.append(f"Channel: {uploader}")
+        parts.append(f"Size: {size_text}")
+        return "  •  ".join(parts)
 
     @staticmethod
     def _format_duration(value: Optional[int]) -> str:
@@ -449,6 +471,8 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
 
     def _apply_canvas_bg(self) -> None:
         try:
+            if self._list_container:
+                self._list_container.configure(fg_color=self._get_row_bg())
             self._list_canvas.configure(bg=self._get_row_bg())
         except Exception:
             pass
@@ -508,7 +532,7 @@ class PlaylistPreviewPanel(ctk.CTkFrame):
         row.title.configure(text=f"{item.index}. {item.title}")
         duration = self._row_duration.get(item.index, self._format_duration(item.duration))
         size_text = self._row_size.get(item.index, "fetch formats")
-        row.meta.configure(text=f"Duration: {duration}  •  Size: {size_text}")
+        row.meta.configure(text=self._build_meta_text(item.index, duration, size_text))
         if thumb_url:
             self._load_thumbnail_async(thumb_url, row)
         else:

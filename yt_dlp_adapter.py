@@ -84,17 +84,7 @@ class YtDlpAdapter:
         self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
 
         self._log("Fetching info...")
-        result = subprocess.run(
-            args,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.stderr:
-            self._log(result.stderr.strip())
-
-        info = json.loads(result.stdout)
+        info = self._run_json_with_retry(args, retry_android=True)
         if playlist_mode and info.get("entries"):
             entry = next((e for e in info["entries"] if e), None)
             if isinstance(entry, dict):
@@ -128,17 +118,7 @@ class YtDlpAdapter:
         self._append_js_runtime_args(args, js_runtime, js_runtime_path, remote_components)
 
         self._log("Fetching playlist preview...")
-        result = subprocess.run(
-            args,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.stderr:
-            self._log(result.stderr.strip())
-
-        info = json.loads(result.stdout)
+        info = self._run_json_with_retry(args, retry_android=True)
         entries = info.get("entries") or []
         total_count = None
         for key in ("playlist_count", "n_entries", "total_entries", "playlist_entries"):
@@ -435,6 +415,48 @@ class YtDlpAdapter:
             args.extend(["--js-runtimes", runtime_arg])
             if remote_components:
                 args.extend(["--remote-components", remote_components])
+
+    def _run_json_with_retry(self, args: List[str], *, retry_android: bool) -> Dict:
+        result = self._run_json_command(args, retry_android=retry_android)
+        return json.loads(result.stdout)
+
+    def _run_json_command(self, args: List[str], *, retry_android: bool) -> subprocess.CompletedProcess[str]:
+        try:
+            result = subprocess.run(
+                args,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = self._format_process_error(exc)
+            if retry_android and self._is_youtube_auth_error(detail):
+                self._log("Retrying with YouTube android client to bypass auth checks...")
+                retry_args = list(args)
+                retry_args.extend(["--extractor-args", "youtube:player_client=android"])
+                return self._run_json_command(retry_args, retry_android=False)
+            if detail:
+                self._log(detail)
+                raise RuntimeError(detail) from exc
+            raise
+        if result.stderr:
+            self._log(result.stderr.strip())
+        return result
+
+    @staticmethod
+    def _format_process_error(exc: subprocess.CalledProcessError) -> str:
+        detail = ""
+        if isinstance(exc.stderr, str) and exc.stderr.strip():
+            detail = exc.stderr.strip()
+        elif isinstance(exc.stdout, str) and exc.stdout.strip():
+            detail = exc.stdout.strip()
+        return detail or f"yt-dlp failed (exit {exc.returncode})."
+
+    @staticmethod
+    def _is_youtube_auth_error(message: str) -> bool:
+        lowered = message.lower()
+        return "sign in to confirm you're not a bot" in lowered or "sign in to confirm you\u2019re not a bot" in lowered
 
     @staticmethod
     def _infer_fps(fmt: Dict) -> Optional[float]:

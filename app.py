@@ -87,6 +87,10 @@ class App(ctk.CTk):
         self._queue_running_id: Optional[str] = None
         self._queue_running_title: Optional[str] = None
         self._progress_detail: Dict[str, Optional[str]] = {"percent": None, "speed": None, "eta": None}
+        self._progress_targets: List[Tuple[ctk.CTkProgressBar, ctk.CTkLabel]] = []
+        self._playlist_download_count: Optional[int] = None
+        self._queue_total_count: Optional[int] = None
+        self._queue_done_count: Optional[int] = None
         self._closing = False
         self._build_job: Optional[str] = None
         self._build_queue_job: Optional[str] = None
@@ -296,6 +300,7 @@ class App(ctk.CTk):
             (self.form_panel.progress, self.form_panel.progress_label),
             (self.playlist_form_panel.progress, self.playlist_form_panel.progress_label),
         ]
+        self._add_queue_progress_target()
         self._set_controls_state("normal")
         self._set_playlist_selection_state(False, False)
         self._bind_global_scroll_events()
@@ -496,6 +501,7 @@ class App(ctk.CTk):
             remote_components=self._normalize_remote_components(),
             title=self._current_info.get("title") if self._current_info else None,
         )
+        self._playlist_download_count = None
         self._enqueue_queue_items([item])
 
     def _on_fetch_playlist(self) -> None:
@@ -597,7 +603,8 @@ class App(ctk.CTk):
                     title=selection.title,
                 )
             )
-        self._enqueue_queue_items(items)
+        self._playlist_download_count = len(items)
+        self._enqueue_queue_items(items, dedupe=False)
 
     def _on_download_playlist(self) -> None:
         url = self.playlist_url_var.get().strip()
@@ -623,6 +630,10 @@ class App(ctk.CTk):
             remote_components=self._normalize_remote_components(),
             title=self._resolve_playlist_history_title(full_playlist=True),
         )
+        if isinstance(self._preview_total, int) and self._preview_total > 0:
+            self._playlist_download_count = self._preview_total
+        else:
+            self._playlist_download_count = None
         self._enqueue_queue_items([item])
 
     def _on_cancel(self) -> None:
@@ -630,12 +641,12 @@ class App(ctk.CTk):
             return
         self._queue_runner.cancel_current()
 
-    def _enqueue_queue_items(self, items: List[QueueItem]) -> None:
+    def _enqueue_queue_items(self, items: List[QueueItem], *, dedupe: bool = True) -> None:
         if not items:
             return
         before = len(self._queue_store.load())
         for item in items:
-            self._queue_runner.enqueue(item, dedupe=True)
+            self._queue_runner.enqueue(item, dedupe=dedupe)
         after = len(self._queue_store.load())
         added = max(0, after - before)
         if added <= 0:
@@ -644,6 +655,8 @@ class App(ctk.CTk):
             self._append_log("Queued 1 item.")
         else:
             self._append_log(f"Queued {added} items.")
+        self._queue_items = [item.to_dict() for item in self._queue_store.load()]
+        self._refresh_queue()
         self._queue_runner.start()
 
     def _refresh_queue(self) -> None:
@@ -662,7 +675,12 @@ class App(ctk.CTk):
         self._update_queue_summary(self._queue_items)
 
     def _on_queue_cancel(self) -> None:
+        was_running = self._queue_runner.is_running_requested()
+        self._append_log("Queue: cancel requested for current item.")
         self._queue_runner.cancel_current()
+        if was_running:
+            self._append_log("Queue: moving to next queued item.")
+            self._queue_runner.start()
 
     def _on_queue_clear(self) -> None:
         if any(item.get("status") == "running" for item in self._queue_items):
@@ -722,40 +740,63 @@ class App(ctk.CTk):
 
     def _update_queue_summary(self, items: List[dict]) -> None:
         total = len(items)
-        running = sum(1 for item in items if item.get("status") == "running")
-        queued = sum(1 for item in items if item.get("status") == "queued")
+        counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0}
+        running_item = None
+        for item in items:
+            status = str(item.get("status") or "queued").lower()
+            if status in counts:
+                counts[status] += 1
+            if status == "running" and running_item is None:
+                running_item = item
         run_requested = self._queue_runner.is_running_requested()
-        running_item = next((item for item in items if item.get("status") == "running"), None)
-        if running and run_requested:
-            state_label = "Running"
-        elif running and not run_requested:
-            state_label = "Stopping"
+        running = counts["running"]
+        queued = counts["queued"]
+        if running:
+            state_label = "Running" if run_requested else "Stopping after current"
         elif run_requested:
-            state_label = "Idle"
+            state_label = "Waiting to start" if queued else "Idle (auto-start on)"
         else:
             state_label = "Stopped"
-        summary = f"Queue: {total} • {state_label}"
-        if total:
-            summary = f"Queue: {total} • {queued} queued • {running} running • {state_label}"
+        parts: List[str] = []
+        for label, key in (
+            ("queued", "queued"),
+            ("running", "running"),
+            ("done", "completed"),
+            ("failed", "failed"),
+            ("cancelled", "cancelled"),
+        ):
+            count = counts[key]
+            if count:
+                parts.append(f"{label} {count}")
+        if total == 0:
+            summary = f"Queue: empty • State: {state_label}"
+        else:
+            summary = f"Queue: {total}"
+            if parts:
+                summary = f"{summary} • " + " • ".join(parts)
+            summary = f"{summary} • State: {state_label}"
         running_id = str(running_item.get("id") or "") if running_item else None
         if running_id != self._queue_running_id:
             self._queue_running_id = running_id
             self._progress_detail = {"percent": None, "speed": None, "eta": None}
         if running_item:
             title = str(running_item.get("title") or running_item.get("url") or "").strip()
-            if len(title) > 48:
-                summary_title = title[:45] + "..."
-            else:
-                summary_title = title
-            if summary_title:
-                summary = f"{summary} • {summary_title}"
             if len(title) > 64:
                 title = title[:61] + "..."
             self._queue_running_title = title or None
         else:
             self._queue_running_title = None
+        if total:
+            self._queue_total_count = total
+            self._queue_done_count = total - counts["queued"] - counts["running"]
+        else:
+            self._queue_total_count = None
+            self._queue_done_count = None
+        if not hasattr(self, "status_panel") or self.status_panel is None:
+            return
         self.status_panel.set_queue_summary(summary)
         self._update_status_activity()
+        self._apply_progress_label_overrides(self._progress_targets[0][1].cget("text") if self._progress_targets else "Idle")
 
     def _prepare_history_context(
         self,
@@ -988,16 +1029,40 @@ class App(ctk.CTk):
             self._log_file.write(f"[{timestamp}] {message}\n")
             self._log_file.flush()
 
+    def _handle_known_error(self, message: str) -> bool:
+        lowered = message.lower()
+        if "sign in to confirm you\u2019re not a bot" in lowered or "sign in to confirm you're not a bot" in lowered:
+            self._append_log(f"Error: {message}")
+            if "youtube_auth" not in self._warning_once:
+                self._warning_once.add("youtube_auth")
+                cookies_choice = self.cookies_var.get().strip()
+                if cookies_choice.lower() == "none":
+                    hint = (
+                        "YouTube requires a logged-in browser. Choose a browser in "
+                        "Cookies (browser), close it fully, then retry."
+                    )
+                else:
+                    hint = (
+                        f"YouTube requires a logged-in session. Make sure you're signed "
+                        f"in on {cookies_choice}, close the browser, then retry."
+                    )
+                self._append_log(hint)
+                messagebox.showwarning("YouTube login required", hint)
+            return True
+        return False
+
     def _maybe_update_progress_detail(self, message: str) -> None:
         if "[download]" not in message:
             return
         updated = False
         match = PROGRESS_PERCENT_RE.search(message)
         if match:
-            percent = f"{int(float(match.group(1)))}%"
+            percent_value = float(match.group(1))
+            percent = f"{int(percent_value)}%"
             if percent != self._progress_detail.get("percent"):
                 self._progress_detail["percent"] = percent
                 updated = True
+            self._update_progress(percent_value / 100.0)
         match = PROGRESS_SPEED_RE.search(message)
         if match:
             speed = match.group(1)
@@ -1041,6 +1106,21 @@ class App(ctk.CTk):
         for bar, bar_label in self._progress_targets:
             bar.set(value)
             bar_label.configure(text=label)
+        self._apply_progress_label_overrides(label)
+
+    def _apply_progress_label_overrides(self, base_label: str) -> None:
+        if self._queue_page:
+            label = base_label
+            if self._queue_total_count:
+                done = self._queue_done_count or 0
+                label = f"{base_label} • {done}/{self._queue_total_count} items"
+            self._queue_page.progress_label.configure(text=label)
+        if self.playlist_form_panel:
+            label = base_label
+            if self._playlist_download_count:
+                suffix = "item" if self._playlist_download_count == 1 else "items"
+                label = f"{base_label} • {self._playlist_download_count} {suffix}"
+            self.playlist_form_panel.progress_label.configure(text=label)
 
     def _update_info_display(self) -> None:
         info = self._current_info or {}
@@ -1182,6 +1262,9 @@ class App(ctk.CTk):
             if isinstance(duration_value, (int, float)):
                 if self.preview_panel:
                     self.preview_panel.update_item_duration(index, int(duration_value))
+            uploader = self._resolve_uploader(info)
+            if uploader != "—" and self.preview_panel:
+                self.preview_panel.update_item_uploader(index, uploader)
             thumb_url = self._resolve_thumbnail_url(info)
             if thumb_url and self.preview_panel:
                 self.preview_panel.update_item_thumbnail(index, thumb_url)
@@ -1320,8 +1403,10 @@ class App(ctk.CTk):
                             self._queue_page.set_items(self._queue_items)
                         self._update_queue_summary(self._queue_items)
                 elif event == "error":
-                    self._append_log(f"Error: {payload}")
-                    messagebox.showerror("Error", str(payload))
+                    message = str(payload)
+                    if not self._handle_known_error(message):
+                        self._append_log(f"Error: {message}")
+                        messagebox.showerror("Error", message)
                     if self._preview_loading:
                         self._preview_loading = False
                         self.preview_panel.set_load_more_state(True, "Load more")
@@ -1444,14 +1529,18 @@ class App(ctk.CTk):
             on_clear_failed=self._on_queue_clear_failed,
             on_remove=self._on_queue_remove,
             on_retry=self._on_queue_retry,
-            on_move_top=self._on_queue_move_top,
-            on_move_up=self._on_queue_move_up,
-            on_move_down=self._on_queue_move_down,
-            on_move_bottom=self._on_queue_move_bottom,
             on_move_to_index=self._on_queue_move_to_index,
         )
         self._queue_page.pack(fill="both", expand=True)
         self._queue_page_built = True
+        self._add_queue_progress_target()
+
+    def _add_queue_progress_target(self) -> None:
+        if not self._queue_page:
+            return
+        target = (self._queue_page.progress, self._queue_page.progress_label)
+        if target not in self._progress_targets:
+            self._progress_targets.append(target)
 
     @staticmethod
     def _open_path(path: str) -> None:
