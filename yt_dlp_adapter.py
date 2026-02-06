@@ -1,9 +1,12 @@
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+
+from controllers.tooling import resolve_ffmpeg_location_dir, resolve_yt_dlp_bin
 
 
 Logger = Callable[[str], None]
@@ -50,11 +53,13 @@ class YtDlpAdapter:
         self._progress = progress_cb or (lambda value: None)
         self._process: Optional[subprocess.Popen[str]] = None
         self._cancel_requested = False
+        self._yt_dlp_bin = resolve_yt_dlp_bin()
+        self._ffmpeg_location_dir = resolve_ffmpeg_location_dir()
 
     def check_available(self) -> bool:
         try:
             subprocess.run(
-                ["yt-dlp", "--version"],
+                [self._yt_dlp_bin, "--version"],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -74,7 +79,9 @@ class YtDlpAdapter:
         js_runtime_path: Optional[str] = None,
         remote_components: Optional[str] = None,
     ) -> Dict:
-        args = ["yt-dlp", "-J"]
+        args = [self._yt_dlp_bin, "-J"]
+        if self._ffmpeg_location_dir:
+            args.extend(["--ffmpeg-location", self._ffmpeg_location_dir])
         if playlist_mode:
             items = playlist_items or "1"
             args.extend(["--playlist-items", items])
@@ -108,12 +115,14 @@ class YtDlpAdapter:
         end_index = max(start_index, start_index + max(1, limit) - 1)
         items_arg = f"{start_index}:{end_index}"
         args = [
-            "yt-dlp",
+            self._yt_dlp_bin,
             "-J",
             "--flat-playlist",
             "--playlist-items",
             items_arg,
         ]
+        if self._ffmpeg_location_dir:
+            args.extend(["--ffmpeg-location", self._ffmpeg_location_dir])
 
         if cookies_from_browser:
             args.extend(["--cookies-from-browser", cookies_from_browser])
@@ -310,7 +319,7 @@ class YtDlpAdapter:
 
         output_template = str(Path(output_dir) / "%(title)s.%(ext)s")
         args = [
-            "yt-dlp",
+            self._yt_dlp_bin,
             "-f",
             format_selector,
             "-o",
@@ -320,6 +329,10 @@ class YtDlpAdapter:
             "--print",
             f"after_move:{self.FILE_PRINT_PREFIX}%(filepath)s",
         ]
+        if sys.platform.startswith("win"):
+            args.append("--windows-filenames")
+        if self._ffmpeg_location_dir:
+            args.extend(["--ffmpeg-location", self._ffmpeg_location_dir])
 
         if playlist_mode:
             args.append("--yes-playlist")

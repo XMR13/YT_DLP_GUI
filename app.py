@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox
 from urllib.parse import parse_qs, urlparse
 
 from controllers.download_controller import DownloadController
+from controllers.app_paths import resolve_app_data_dir, resolve_default_output_dir
 from controllers.history_store import HistoryEntry, HistoryStore
 from controllers.queue_runner import QueueRunner, YtDlpExecutor
 from controllers.queue_store import QueueItem, QueueStore
@@ -102,7 +103,7 @@ class App(ctk.CTk):
         self.playlist_url_var = ctk.StringVar()
         self.format_type_var = ctk.StringVar(value="Video + Audio")
         self.resolution_var = ctk.StringVar(value="Best available")
-        self.output_dir_var = ctk.StringVar(value=str(Path.cwd()))
+        self.output_dir_var = ctk.StringVar(value=str(resolve_default_output_dir()))
         self.cookies_var = ctk.StringVar(value="None")
         self.js_runtime_var = ctk.StringVar(value="Auto")
         self.js_runtime_path_var = ctk.StringVar(value="")
@@ -421,7 +422,10 @@ class App(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _handle_missing_yt_dlp(self) -> None:
-        self._append_log("yt-dlp not found. Install it with: pip install yt-dlp")
+        self._append_log(
+            "yt-dlp not found. Install it with: pip install yt-dlp "
+            "(or set YTDLP_GUI_YTDLP_PATH to a yt-dlp executable)."
+        )
         self._set_controls_state("disabled")
         messagebox.showerror("yt-dlp missing", "yt-dlp is not installed or not on PATH.")
 
@@ -1675,7 +1679,7 @@ class App(ctk.CTk):
 
     def _init_log_file(self) -> Optional[object]:
         try:
-            logs_dir = Path(__file__).resolve().parent / "logs"
+            logs_dir = resolve_app_data_dir() / "logs"
             logs_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_path = logs_dir / f"yt-dlp-gui_{stamp}.log"

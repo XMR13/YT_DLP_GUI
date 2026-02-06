@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
+
+from controllers.app_paths import resolve_app_data_dir
 
 ALLOWED_COOKIE_BROWSERS = {"chrome", "edge", "firefox"}
 ALLOWED_JS_RUNTIMES = {"node", "deno", "bun", "quickjs"}
@@ -241,10 +242,4 @@ class QueueStore:
 
     @staticmethod
     def _resolve_queue_path(app_name: str) -> Path:
-        if sys.platform.startswith("win"):
-            base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-        elif sys.platform == "darwin":
-            base = Path.home() / "Library" / "Application Support"
-        else:
-            base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-        return base / app_name / "queue.json"
+        return resolve_app_data_dir(app_name) / "queue.json"

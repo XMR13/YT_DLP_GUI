@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
+
+from controllers.app_paths import resolve_app_data_dir
 
 
 @dataclass(frozen=True)
@@ -100,10 +101,4 @@ class HistoryStore:
 
     @staticmethod
     def _resolve_history_path(app_name: str) -> Path:
-        if sys.platform.startswith("win"):
-            base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-        elif sys.platform == "darwin":
-            base = Path.home() / "Library" / "Application Support"
-        else:
-            base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-        return base / app_name / "history.json"
+        return resolve_app_data_dir(app_name) / "history.json"
