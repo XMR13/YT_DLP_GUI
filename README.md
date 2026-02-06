@@ -48,7 +48,10 @@ python app.py
 
 ### Logs
 
-- Each run writes a log file in `logs/` (ignored by git).
+- Each run writes a log file in the per-user app data folder.
+  - Windows: `%APPDATA%\\yt-dlp-gui\\logs\\`
+  - macOS: `~/Library/Application Support/yt-dlp-gui/logs/`
+  - Linux: `${XDG_DATA_HOME:-~/.local/share}/yt-dlp-gui/logs/`
 
 ### History storage
 
@@ -62,3 +65,7 @@ History is stored as JSON in the per-user app data folder:
 
 - If you see "Signature solving failed", select a JS runtime (node/deno/bun) and set
   "EJS scripts source" to `ejs:github` or `ejs:npm` in the UI, then retry.
+
+### Windows portable build
+
+See `packaging/README_WINDOWS.md` and `scripts/build_windows.ps1`.
