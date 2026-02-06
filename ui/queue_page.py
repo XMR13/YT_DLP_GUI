@@ -94,6 +94,9 @@ class QueuePage(ctk.CTkFrame):
         }
         self._row_color = ("#F2F2F2", "#2B2B2B")
         self._selected_color = ("#D8D8D8", "#3A3A3A")
+        self._filter_var = ctk.StringVar(value="All")
+        self._filter_values = ["All", "Queued", "Running", "Failed", "Cancelled", "Done"]
+        self._all_items: List[dict] = []
         self._items: List[dict] = []
         self._queued_positions: List[int] = []
         self._queued_lookup: dict[int, int] = {}
@@ -182,6 +185,22 @@ class QueuePage(ctk.CTkFrame):
         )
         self._clear_failed_btn.pack(side="left", padx=4)
 
+        filter_bar = ctk.CTkFrame(self, fg_color="transparent")
+        filter_bar.pack(fill="x", padx=6, pady=(0, 6))
+        filter_label = ctk.CTkLabel(
+            filter_bar,
+            text="Filter:",
+            font=ctk.CTkFont("Segoe UI", 12),
+        )
+        filter_label.pack(side="left", padx=(6, 8))
+        self._filter_segment = ctk.CTkSegmentedButton(
+            filter_bar,
+            values=self._filter_values,
+            variable=self._filter_var,
+            command=self._on_filter_change,
+        )
+        self._filter_segment.pack(side="left")
+
         self._selection_bar = ctk.CTkFrame(self, fg_color="transparent")
         self._selection_label = ctk.CTkLabel(
             self._selection_bar,
@@ -264,10 +283,24 @@ class QueuePage(ctk.CTkFrame):
         self._sync_empty_state()
 
     def set_items(self, items: List[dict]) -> None:
-        self._items = list(items)
-        total = len(self._items)
+        self._all_items = list(items)
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        label = (self._filter_var.get() or "All").strip()
+        key = label.lower()
+        if key == "all":
+            self._items = list(self._all_items)
+        elif key == "done":
+            self._items = [item for item in self._all_items if str(item.get("status") or "").lower() == "completed"]
+        else:
+            self._items = [
+                item for item in self._all_items if str(item.get("status") or "").lower() == key
+            ]
+        total = len(self._all_items)
+        filtered = len(self._items)
         counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0}
-        for item in self._items:
+        for item in self._all_items:
             status = str(item.get("status") or "queued").lower()
             if status in counts:
                 counts[status] += 1
@@ -288,6 +321,8 @@ class QueuePage(ctk.CTkFrame):
             text = f"{total} item" + ("s" if total != 1 else "")
             if parts:
                 text = f"{text} • " + " • ".join(parts)
+            if key != "all":
+                text = f"{text} • Filter: {label} ({filtered})"
         self._count.configure(text=text)
 
         self._queued_positions = [
@@ -305,6 +340,9 @@ class QueuePage(ctk.CTkFrame):
         self._ensure_row_pool()
         self._sync_selection_bar()
 
+    def _on_filter_change(self, _value: str) -> None:
+        self._apply_filter()
+
     def get_scroll_frame(self) -> tk.Canvas:
         return self._list_canvas
 
@@ -321,9 +359,13 @@ class QueuePage(ctk.CTkFrame):
                 self._empty_label = None
             return
         if self._empty_label is None:
+            message = "Queue is empty."
+            if self._all_items:
+                label = (self._filter_var.get() or "All").strip()
+                message = f"No items in {label}."
             self._empty_label = ctk.CTkLabel(
                 self._list_container,
-                text="Queue is empty.",
+                text=message,
                 font=ctk.CTkFont("Segoe UI", 13),
             )
             self._empty_label.place(relx=0.5, rely=0.5, anchor="center")
