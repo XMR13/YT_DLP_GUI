@@ -1,5 +1,7 @@
 ## yt-dlp GUI
 
+<img src="assets/icon.png" alt="yt-dlp GUI logo" width="240" />
+
 Simple Windows-friendly GUI wrapper around `yt-dlp`.
 
 ### Highlights

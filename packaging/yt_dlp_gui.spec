@@ -12,6 +12,12 @@ project_root = Path.cwd().resolve()
 
 datas = []
 datas += collect_data_files("customtkinter")
+assets_dir = project_root / "assets"
+app_icon_path = assets_dir / "app_icon.ico"
+for asset_name in ("icon.png", "app_icon.ico"):
+    asset_path = assets_dir / asset_name
+    if asset_path.is_file():
+        datas.append((str(asset_path), "assets"))
 
 a = Analysis(
     [str(project_root / "app.py")],
@@ -44,6 +50,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
+    icon=str(app_icon_path) if app_icon_path.is_file() else None,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,

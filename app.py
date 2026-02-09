@@ -55,6 +55,8 @@ class App(ctk.CTk):
         self.title("yt-dlp GUI")
         self.geometry("900x680")
         self.minsize(860, 620)
+        self._window_icon: Optional[tk.PhotoImage] = None
+        self._apply_window_icon()
 
         self._event_queue: Queue[Tuple[str, object]] = Queue()
         self._adapter = YtDlpAdapter(self._enqueue_log, self._enqueue_progress)
@@ -127,6 +129,26 @@ class App(ctk.CTk):
         self.resolution_var.trace_add("write", self._on_selection_change)
         self._queue_runner.load()
 
+    @staticmethod
+    def _resolve_asset_path(name: str) -> Path:
+        if getattr(sys, "frozen", False):
+            base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+        else:
+            base = Path(__file__).resolve().parent
+        return base / "assets" / name
+
+    def _apply_window_icon(self) -> None:
+        icon_png = self._resolve_asset_path("icon.png")
+        icon_ico = self._resolve_asset_path("app_icon.ico")
+        try:
+            if sys.platform.startswith("win") and icon_ico.is_file():
+                self.iconbitmap(default=str(icon_ico))
+            if icon_png.is_file():
+                self._window_icon = tk.PhotoImage(file=str(icon_png))
+                self.iconphoto(True, self._window_icon)
+        except tk.TclError:
+            self._window_icon = None
+
     def _schedule_build_ui(self) -> None:
         if self._build_job:
             self.after_cancel(self._build_job)
@@ -136,7 +158,7 @@ class App(ctk.CTk):
         self._build_job = None
         if self._closing or not self.winfo_exists():
             return
-        header = Header(self)
+        header = Header(self, logo_path=self._resolve_asset_path("icon.png"))
         header.pack(fill="x", padx=20, pady=(20, 10))
         self._sync_root_bg(header.cget("fg_color"))
 
