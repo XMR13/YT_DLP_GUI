@@ -1351,6 +1351,7 @@ class App(ctk.CTk):
             return
         self._apply_formats(list(options))
         self._apply_playlist_item_info(None, dict(info), update_current=True)
+        self._maybe_log_no_60fps_hint(list(options), dict(info))
 
     def _clear_formats_request(self, request_id: int) -> None:
         self._formats_pending_options.pop(request_id, None)
@@ -1359,6 +1360,20 @@ class App(ctk.CTk):
         if isinstance(index, int) and self._formats_inflight_by_index.get(index) == request_id:
             self._formats_inflight_by_index.pop(index, None)
 
+    def _maybe_log_no_60fps_hint(self, options: List[FormatOption], info: Dict) -> None:
+        if self.format_type_var.get() == "Audio only":
+            return
+        if any(isinstance(option.fps, (int, float)) and float(option.fps) >= 60.0 for option in options):
+            return
+        video_key = str(info.get("id") or info.get("webpage_url") or info.get("title") or "").strip().lower()
+        if not video_key:
+            video_key = "unknown"
+        marker = f"no_60fps:{video_key}"
+        if marker in self._warning_once:
+            return
+        self._warning_once.add(marker)
+        self._append_log("No 60fps formats were reported for this video.")
+        self._append_log("This is likely source/yt-dlp availability, not a UI filter issue.")
 
     def _apply_playlist_item_info(self, index: Optional[int], info: Dict, update_current: bool) -> None:
         if index is not None:

@@ -43,6 +43,10 @@ class YtDlpAdapter:
     FILE_PRINT_PREFIX = "__FILE__:"
     ALLOWED_JS_RUNTIMES = {"node", "deno", "bun", "quickjs"}
     ALLOWED_REMOTE_COMPONENTS = {"ejs:github", "ejs:npm"}
+    _YOUTUBE_SKIPPED_FORMAT_WARNINGS = (
+        "Some web client https formats have been skipped",
+        "Some web_safari client https formats have been skipped",
+    )
 
     def __init__(
         self,
@@ -315,7 +319,7 @@ class YtDlpAdapter:
         elif format_id:
             format_selector = f"{format_id}+bestaudio/best"
         else:
-            format_selector = "best"
+            format_selector = "bestvideo+bestaudio/best"
 
         output_template = str(Path(output_dir) / "%(title)s.%(ext)s")
         args = [
@@ -408,8 +412,7 @@ class YtDlpAdapter:
         if self._cancel_requested:
             raise DownloadCancelled()
         if had_forbidden or had_sabr_warning:
-            retry_args = list(args)
-            retry_args.extend(["--extractor-args", "youtube:player_client=android"])
+            retry_args = self._with_extractor_args(args, "youtube:player_client=android")
             self._log("Retrying with YouTube android client due to 403/SABR warning...")
             self._process = subprocess.Popen(
                 retry_args,
@@ -572,13 +575,20 @@ class YtDlpAdapter:
             detail = self._format_process_error(exc)
             if retry_android and self._is_youtube_auth_error(detail):
                 self._log("Retrying with YouTube android client to bypass auth checks...")
-                retry_args = list(args)
-                retry_args.extend(["--extractor-args", "youtube:player_client=android"])
+                retry_args = self._with_extractor_args(args, "youtube:player_client=android")
                 return self._run_json_command(retry_args, retry_android=False)
             if detail:
                 self._log(detail)
                 raise RuntimeError(detail) from exc
             raise
+        if (
+            retry_android
+            and self._contains_youtube_skipped_warning(result.stderr or "")
+            and not self._has_android_player_client(args)
+        ):
+            self._log("Retrying info fetch with YouTube android client due to skipped formats...")
+            retry_args = self._with_extractor_args(args, "youtube:player_client=android")
+            return self._run_json_command(retry_args, retry_android=False)
         if result.stderr:
             self._log(result.stderr.strip())
         return result
@@ -596,6 +606,31 @@ class YtDlpAdapter:
     def _is_youtube_auth_error(message: str) -> bool:
         lowered = message.lower()
         return "sign in to confirm you're not a bot" in lowered or "sign in to confirm you\u2019re not a bot" in lowered
+
+    @classmethod
+    def _contains_youtube_skipped_warning(cls, message: str) -> bool:
+        return any(marker in message for marker in cls._YOUTUBE_SKIPPED_FORMAT_WARNINGS)
+
+    @staticmethod
+    def _has_android_player_client(args: List[str]) -> bool:
+        for index, value in enumerate(args):
+            if value != "--extractor-args":
+                continue
+            if index + 1 >= len(args):
+                continue
+            if "youtube:player_client=android" in args[index + 1]:
+                return True
+        return False
+
+    @staticmethod
+    def _with_extractor_args(args: List[str], extractor_args: str) -> List[str]:
+        result = list(args)
+        insertion = ["--extractor-args", extractor_args]
+        if "--" not in result:
+            result.extend(insertion)
+            return result
+        marker_index = result.index("--")
+        return result[:marker_index] + insertion + result[marker_index:]
 
     @staticmethod
     def _infer_fps(fmt: Dict) -> Optional[float]:
